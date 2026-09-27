@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from seo import __version__
 from seo.config import load_settings
 from seo.pipeline import SEOPipeline
+from seo.summary import summarize
 from seo.urlutils import normalize_input, site_key
 
 state: dict = {}
@@ -34,6 +35,7 @@ class AnalyzeRequest(BaseModel):
     force: bool = False
     use_llm: bool = True
     max_pages: Optional[int] = Field(None, ge=1, le=50)
+    full: bool = False
 
 
 def _pipeline() -> SEOPipeline:
@@ -70,7 +72,7 @@ async def analyze(req: AnalyzeRequest):
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"from_cache": out.from_cache, "file": str(out.path), "warning": _llm_warning(out.report),
-            "report": out.report}
+            "report": out.report if req.full else summarize(out.report)}
 
 
 @app.post("/jobs", status_code=202)
@@ -120,12 +122,14 @@ async def list_reports():
 
 
 @app.get("/reports/{site}")
-async def get_report(site: str):
+async def get_report(site: str, full: bool = False):
+    """Compact summary by default; ?full=true for every check, crawl detail and page."""
     try:
         key = site_key(normalize_input(site))
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    data = _pipeline().storage.load_latest(key)
+    storage = _pipeline().storage
+    data = storage.load_latest(key) if full else storage.load_summary(key)
     if not data:
         raise HTTPException(404, f"no report for {key}")
     return data

@@ -24,7 +24,7 @@ Open `config.yaml` and set `crawl.user_agent` to include your real contact email
 
 ```powershell
 python main.py www.someweb.com                  # analyze one site
-python main.py www.someweb.com --out result.json  # also export to a specific file
+python main.py www.someweb.com --out result.json  # also export the summary to a specific file (add --full for everything)
 python main.py site1.com site2.com site3.com    # several sites (3 in parallel)
 python main.py --input urls.txt                 # one URL per line, # = comment
 python main.py www.someweb.com --force          # ignore a report younger than 24h
@@ -44,14 +44,14 @@ python main.py --serve          # http://127.0.0.1:8000/docs
 | `POST /analyze` `{"url": "www.someweb.com"}` | Run and wait (1–3 min) |
 | `POST /jobs` → `GET /jobs/{id}` | Run in the background and poll |
 | `GET /reports` | Latest result per site |
-| `GET /reports/{site}` | Full JSON for one site |
+| `GET /reports/{site}` | Summary JSON for one site (`?full=true` for the full report) |
 | `GET /health` | Status, and whether the LLM key is loaded |
 
 ## Output
 
 ```
-output/sites/<site>.json               latest report per site
-output/history/<site>/<timestamp>.json every run, never overwritten
+output/sites/<site>.json               latest report per site: short summary, one sentence per check
+output/history/<site>/<timestamp>.json every run, full detail (all checks, crawl, pages), never overwritten
 output/index.jsonl                     one summary line per run: load this for dashboards / bulk queries
 cache/<site>/<timestamp>/              raw HTML + crawl metadata (used by --reanalyze)
 ```

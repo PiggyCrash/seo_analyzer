@@ -18,6 +18,7 @@ from pathlib import Path
 
 from seo.config import load_settings
 from seo.pipeline import AnalysisOutcome, SEOPipeline
+from seo.summary import summarize
 from seo.urlutils import normalize_input, site_key
 
 
@@ -26,6 +27,7 @@ def parse_args(argv=None):
     p.add_argument("urls", nargs="*", help="one or more sites, e.g. www.someweb.com")
     p.add_argument("-i", "--input", help="text file with one URL per line (# for comments)")
     p.add_argument("-o", "--out", help="also write the report to this path (single site only)")
+    p.add_argument("--full", action="store_true", help="with --out: write the full report instead of the summary")
     p.add_argument("--force", action="store_true", help="ignore a fresh cached report")
     p.add_argument("--reanalyze", action="store_true", help="re-run extraction + LLM on the last cached crawl")
     p.add_argument("--no-llm", action="store_true", help="deterministic checks only")
@@ -135,7 +137,8 @@ async def run(args) -> int:
     print_llm_notice([(u, r) for u, r in zip(urls, results) if r and not r.from_cache], settings)
     if args.out and done:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.out).write_text(json.dumps(done[0].report, ensure_ascii=False, indent=2), encoding="utf-8")
+        data = done[0].report if args.full else summarize(done[0].report)
+        Path(args.out).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"\nExported: {Path(args.out).resolve()}")
     print(f"\nDone: {len(done)}/{n} succeeded.")
     return 0 if len(done) == n else 1

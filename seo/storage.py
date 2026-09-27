@@ -1,7 +1,7 @@
 """File storage.
 
-output/sites/<site>.json               latest report per site
-output/history/<site>/<timestamp>.json every run, never overwritten
+output/sites/<site>.json               latest report per site, compact summary (seo/summary.py)
+output/history/<site>/<timestamp>.json every run, full detail, never overwritten
 output/index.jsonl                     one summary line per run (append-only, easy to load at scale)
 cache/<site>/<timestamp>/              raw crawl (crawl.json + pages/*.html) for --reanalyze
 """
@@ -17,6 +17,7 @@ from typing import Optional
 from .config import StorageConfig
 from .crawler import CrawlResult
 from .schema import SiteReport
+from .summary import summarize
 
 _lock = threading.Lock()
 
@@ -47,6 +48,7 @@ class Storage:
     def save_report(self, report: SiteReport) -> Path:
         data = report.model_dump(mode="json")
         text = json.dumps(data, ensure_ascii=False, indent=2)
+        short = json.dumps(summarize(data), ensure_ascii=False, indent=2)
         path = self.site_file(report.site)
         hist = self.history / report.site / f"{_stamp(report.analyzed_at)}.json"
         line = {
@@ -59,7 +61,7 @@ class Storage:
             "file": str(hist.relative_to(self.out)),
         }
         with _lock:
-            _atomic_write(path, text)
+            _atomic_write(path, short)
             _atomic_write(hist, text)
             self.out.mkdir(parents=True, exist_ok=True)
             with self.index.open("a", encoding="utf-8") as fh:
@@ -67,6 +69,15 @@ class Storage:
         return path
 
     def load_latest(self, key: str) -> Optional[dict]:
+        """Latest full report (from history/)."""
+        folder = self.history / key
+        runs = sorted(folder.glob("*.json")) if folder.exists() else []
+        if not runs:
+            return None
+        return json.loads(runs[-1].read_text(encoding="utf-8"))
+
+    def load_summary(self, key: str) -> Optional[dict]:
+        """Latest compact summary (from sites/)."""
         path = self.site_file(key)
         if not path.exists():
             return None
