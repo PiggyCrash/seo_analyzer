@@ -1,0 +1,37 @@
+crawl:
+  max_pages: 15
+  per_domain_concurrency: 2
+  delay_seconds: 1.0
+  request_timeout: 15
+  max_redirects: 5
+  max_retries: 2
+  site_time_budget: 180
+  max_page_bytes: 5000000
+  max_site_bytes: 50000000
+  user_agent: "SEOAnalyzerBot/1.0 (+mailto:you@example.com)"
+  include_subdomains: false
+  respect_robots: true
+
+llm:
+  enabled: true
+  base_url: "https://api.groq.com/openai/v1"
+  model: "openai/gpt-oss-120b"
+  api_key_env: GROQ_API_KEY
+  max_tokens: 3500
+  max_digest_chars: 12000
+  requests_per_minute: 2
+  temperature: 0.2
+  timeout: 180
+  max_retries: 3
+  quota_cooldown_seconds: 900
+  json_mode: true
+  min_ok_pages: 3
+
+storage:
+  output_dir: output
+  cache_dir: cache
+  skip_if_fresh_hours: 24
+  include_pages: true
+
+run:
+  site_concurrency: 3

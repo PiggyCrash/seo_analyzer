@@ -1,0 +1,446 @@
+"""Deterministic SEO facts: per-page extraction and site-level rollup. No LLM here."""
+from __future__ import annotations
+
+import json
+import re
+from collections import Counter
+from typing import Optional
+from urllib.parse import urljoin, urlparse
+
+from bs4 import BeautifulSoup
+
+from .schema import (Check, ContentStats, CrawlSummary, PageFacts, PageRecord, TechnicalSEO,
+                     not_checked)
+from .urlutils import bare_host, classify_path, normalize_url
+
+TRACKER_IDS = {
+    "ga4": re.compile(r"\bG-[A-Z0-9]{6,12}\b"),
+    "universal_analytics": re.compile(r"\bUA-\d{4,10}-\d{1,4}\b"),
+    "gtm": re.compile(r"\bGTM-[A-Z0-9]{4,9}\b"),
+    "google_ads": re.compile(r"\bAW-\d{6,12}\b"),
+    "meta_pixel": re.compile(r"fbq\(\s*['\"]init['\"]\s*,\s*['\"](\d{8,20})['\"]"),
+    "tiktok_pixel": re.compile(r"ttq\.load\(\s*['\"]([A-Z0-9]{10,30})['\"]"),
+}
+TRACKER_MARKERS = {
+    "meta_pixel": ("connect.facebook.net", "fbevents.js", "facebook.com/tr?"),
+    "tiktok_pixel": ("analytics.tiktok.com",),
+    "linkedin_insight": ("snap.licdn.com", "_linkedin_partner_id"),
+    "hotjar": ("static.hotjar.com",),
+    "microsoft_clarity": ("clarity.ms/tag",),
+    "snapchat_pixel": ("sc-static.net/scevent",),
+    "pinterest_tag": ("s.pinimg.com/ct/",),
+    "x_pixel": ("static.ads-twitter.com",),
+    "reddit_pixel": ("redditstatic.com/ads",),
+    "plausible": ("plausible.io/js",),
+    "segment": ("cdn.segment.com",),
+    "hubspot": ("js.hs-scripts.com", "js.hs-analytics.net"),
+}
+CONSENT_VENDORS = (
+    ("Cookiebot", ("consent.cookiebot.com", "cookiebot")),
+    ("OneTrust", ("cdn.cookielaw.org", "otsdkstub", "onetrust")),
+    ("CookieYes", ("cdn-cookieyes.com", "cookieyes", "cookie-law-info")),
+    ("Osano", ("cmp.osano.com",)),
+    ("Termly", ("app.termly.io",)),
+    ("iubenda", ("iubenda.com",)),
+    ("Didomi", ("didomi",)),
+    ("Usercentrics", ("usercentrics",)),
+    ("TrustArc", ("trustarc", "truste.com")),
+    ("Quantcast Choice", ("quantcast.mgr.consensu.org", "cmp.quantcast.com")),
+    ("Complianz", ("complianz",)),
+    ("CookieFirst", ("cookiefirst",)),
+    ("Axeptio", ("axeptio",)),
+    ("Civic Cookie Control", ("civiccomputing.com",)),
+    ("Cookie Script", ("cookie-script.com",)),
+    ("Finsweet Cookie Consent", ("fs-cc",)),
+    ("Klaro", ("klaro",)),
+    ("Cookie Consent (Osano OSS)", ("cookieconsent.min.js", "cookieconsent2")),
+)
+CONSENT_TEXT = ("we use cookies", "this website uses cookies", "this site uses cookies",
+                "cookie settings", "cookie preferences", "accept all cookies", "manage cookies")
+PLATFORMS = (
+    ("Webflow", ("data-wf-site", "webflow.io", "assets.website-files.com", "website-files.com")),
+    ("WordPress", ("/wp-content/", "/wp-includes/")),
+    ("Shopify", ("cdn.shopify.com", "shopify.theme")),
+    ("Wix", ("static.wixstatic.com", "wix-bolt")),
+    ("Squarespace", ("static1.squarespace.com", "squarespace.com")),
+    ("Framer", ("framerusercontent.com", "framer.website")),
+    ("HubSpot CMS", ("hs-sites.com", "hubspot-cms")),
+    ("Ghost", ("ghost-portal", "content=\"ghost")),
+    ("Drupal", ("drupal-settings-json", "/sites/default/files/")),
+    ("Joomla", ("/media/jui/", "joomla")),
+    ("Next.js", ("__next_data__", "/_next/static/")),
+    ("Nuxt", ("__nuxt__", "/_nuxt/")),
+    ("Gatsby", ("___gatsby",)),
+)
+
+
+def _txt(el) -> str:
+    return " ".join(el.get_text(" ").split()) if el else ""
+
+
+def _has_directive(value: Optional[str], directive: str) -> bool:
+    tokens = [t.strip() for t in re.split(r"[,:;]", (value or "").lower())]
+    return directive in tokens or "none" in tokens
+
+
+def _collect_types(obj, out: list) -> None:
+    if isinstance(obj, list):
+        for item in obj:
+            _collect_types(item, out)
+    elif isinstance(obj, dict):
+        t = obj.get("@type")
+        for name in (t if isinstance(t, list) else [t]):
+            if isinstance(name, str) and name not in out:
+                out.append(name)
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                _collect_types(v, out)
+
+
+def _detect_trackers(soup: BeautifulSoup) -> dict[str, list[str]]:
+    parts = []
+    for s in soup.find_all("script"):
+        if s.get("src"):
+            parts.append(s["src"])
+        if s.string:
+            parts.append(s.string)
+    for tag in soup.find_all(["iframe", "img"]):
+        src = tag.get("src") or ""
+        if "googletagmanager" in src or "facebook.com/tr" in src:
+            parts.append(src)
+    blob = "\n".join(parts)
+    blob_lower = blob.lower()
+    found: dict[str, list[str]] = {}
+    for name, rx in TRACKER_IDS.items():
+        ids = sorted(set(rx.findall(blob)))
+        if ids:
+            found[name] = ids
+    for name, markers in TRACKER_MARKERS.items():
+        if name not in found and any(m in blob_lower for m in markers):
+            found[name] = []
+    return found
+
+
+def _detect_platform(lower: str, generator: Optional[str], headers: dict) -> Optional[str]:
+    probe = f"{lower} {(generator or '').lower()} {headers.get('x-powered-by', '').lower()}"
+    for name, markers in PLATFORMS:
+        if name.lower().split()[0] in (generator or "").lower():
+            return name
+        if any(m in probe for m in markers):
+            return name
+    return None
+
+
+def extract_page(url: str, final_url: Optional[str], html: str, headers: dict,
+                 *, is_home: bool = False) -> PageFacts:
+    base = final_url or url
+    base_host = urlparse(base).hostname or ""
+    soup = BeautifulSoup(html, "lxml")
+    lower = html.lower()
+
+    metas: dict[str, str] = {}
+    og: dict[str, str] = {}
+    tw: dict[str, str] = {}
+    for m in soup.find_all("meta"):
+        name = (m.get("name") or "").strip().lower()
+        prop = (m.get("property") or "").strip().lower()
+        content = (m.get("content") or "").strip()
+        if prop.startswith("og:"):
+            og.setdefault(prop, content)
+        if name.startswith("twitter:") or prop.startswith("twitter:"):
+            tw.setdefault(name or prop, content)
+        if name:
+            metas.setdefault(name, content)
+
+    title = _txt(soup.title) or None
+    desc = metas.get("description") or None
+    meta_robots = ", ".join(v for v in (metas.get("robots"), metas.get("googlebot")) if v) or None
+    x_robots = headers.get("x-robots-tag")
+
+    canonical, hreflang = None, []
+    for link in soup.find_all("link", href=True):
+        rels = [r.lower() for r in (link.get("rel") or [])]
+        if "canonical" in rels and canonical is None:
+            canonical = urljoin(base, link["href"].strip())
+        if "alternate" in rels and link.get("hreflang"):
+            hreflang.append(link["hreflang"])
+
+    h1s = soup.find_all("h1")
+    h1 = [t for t in (_txt(h) for h in h1s) if t]
+    h2 = [t for t in (_txt(h) for h in soup.find_all("h2")) if t][:15]
+    levels = [int(h.name[1]) for h in soup.find_all(re.compile(r"^h[1-6]$"))]
+    skips = sum(1 for a, b in zip(levels, levels[1:]) if b > a + 1)
+
+    imgs = soup.find_all("img")
+    missing_alt = sum(1 for i in imgs if not i.has_attr("alt"))
+    empty_alt = sum(1 for i in imgs if i.has_attr("alt") and not str(i["alt"]).strip())
+
+    internal = external = nofollow = 0
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.startswith(("mailto:", "tel:", "javascript:", "#")):
+            continue
+        host = urlparse(urljoin(base, href)).hostname
+        if not host:
+            continue
+        if bare_host(host) == bare_host(base_host):
+            internal += 1
+        else:
+            external += 1
+        if "nofollow" in [r.lower() for r in (a.get("rel") or [])]:
+            nofollow += 1
+
+    types: list[str] = []
+    blocks = invalid = 0
+    for s in soup.find_all("script", attrs={"type": re.compile("ld\\+json", re.I)}):
+        blocks += 1
+        try:
+            _collect_types(json.loads(s.string or s.get_text() or ""), types)
+        except (ValueError, TypeError):
+            invalid += 1
+    for el in soup.find_all(attrs={"itemtype": True}):
+        t = str(el["itemtype"]).rstrip("/").split("/")[-1]
+        if t and t not in types:
+            types.append(t)
+
+    trackers = _detect_trackers(soup)
+    platform = _detect_platform(lower, metas.get("generator"), headers) if is_home else None
+
+    for t in soup(["script", "style", "noscript", "template", "svg", "iframe"]):
+        t.decompose()
+    body = soup.body or soup
+    body_text = " ".join(body.get_text(" ").split())
+    word_count = len(body_text.split())
+    text_lower = body_text.lower()
+
+    consent = next((n for n, marks in CONSENT_VENDORS if any(m in lower for m in marks)), None)
+    if consent is None and "cookie" in text_lower and any(p in text_lower for p in CONSENT_TEXT):
+        consent = "heuristic:banner_text"
+
+    main = soup.find("main") or soup.find("article")
+    if main is None:
+        for t in body.find_all(["nav", "footer", "header"]):
+            t.decompose()
+        main = body
+    excerpt = " ".join(main.get_text(" ").split())[:1500]
+
+    page_type = "home" if is_home else classify_path(urlparse(base).path)[0]
+    return PageFacts(
+        url=base, page_type=page_type, title=title, title_length=len(title or ""),
+        meta_description=desc, meta_description_length=len(desc or ""), canonical=canonical,
+        canonical_is_self=(normalize_url(canonical) == normalize_url(base)) if canonical else None,
+        meta_robots=meta_robots, x_robots_tag=x_robots,
+        noindex=_has_directive(meta_robots, "noindex") or _has_directive(x_robots, "noindex"),
+        lang=(soup.html.get("lang") if soup.html else None) or None,
+        viewport=metas.get("viewport") or None, hreflang=hreflang, og=og, twitter=tw,
+        h1=h1, h1_count=len(h1s), h2=h2, h3_count=len(soup.find_all("h3")), heading_skips=skips,
+        word_count=word_count, images_total=len(imgs), images_missing_alt=missing_alt,
+        images_empty_alt=empty_alt, internal_links=internal, external_links=external,
+        nofollow_links=nofollow, schema_types=types, jsonld_blocks=blocks, jsonld_invalid=invalid,
+        trackers=trackers, consent_vendor=consent, platform=platform,
+        generator=metas.get("generator") or None, text_excerpt=excerpt)
+
+
+def _ratio(affected: int, checked: int) -> str:
+    if checked == 0:
+        return "not_checked"
+    if affected == 0:
+        return "present"
+    return "missing" if affected == checked else "partial"
+
+
+def _examples(urls: list[str]) -> list[str]:
+    return urls[:5]
+
+
+def _text_check(facts: list[PageFacts], home: PageFacts, attr: str, lo: int, hi: int) -> Check:
+    values = [(f.url, getattr(f, attr)) for f in facts]
+    missing = [u for u, v in values if not v]
+    too_long = [u for u, v in values if v and len(v) > hi]
+    too_short = [u for u, v in values if v and len(v) < lo]
+    counts = Counter(v for _, v in values if v)
+    dupes = [u for u, v in values if v and counts[v] > 1]
+    affected = len(set(missing + too_long + too_short + dupes))
+    if len(missing) == len(values):
+        status = "missing"
+    else:
+        status = "partial" if affected else "present"
+    return Check(status=status, value=getattr(home, attr), pages_checked=len(values),
+                 pages_affected=affected,
+                 details={"missing": len(missing), "too_long": len(too_long), "too_short": len(too_short),
+                          "duplicates": len(dupes), "recommended_length": f"{lo}-{hi}",
+                          "homepage_length": len(getattr(home, attr) or ""),
+                          "examples_missing": _examples(missing), "examples_too_long": _examples(too_long)})
+
+
+def rollup(records: list[PageRecord], crawl: CrawlSummary) -> tuple[TechnicalSEO, ContentStats]:
+    facts = [r.facts for r in records if r.facts]
+    home = records[0].facts if records and records[0].facts else None
+    reason = crawl.reason or "no_usable_pages"
+
+    checks: dict[str, Check] = {}
+    page_checks = ("meta_title", "meta_description", "open_graph", "twitter_card", "h1",
+                   "heading_hierarchy", "image_alt_text", "schema_markup", "canonical", "indexability",
+                   "mobile_viewport", "lang", "hreflang", "analytics", "cookie_banner", "platform")
+    if not facts or home is None:
+        for name in page_checks:
+            checks[name] = not_checked(reason if not facts else "homepage_not_usable")
+    else:
+        n = len(facts)
+        checks["meta_title"] = _text_check(facts, home, "title", 30, 60)
+        checks["meta_description"] = _text_check(facts, home, "meta_description", 70, 160)
+
+        og_bad = [f.url for f in facts if not (f.og.get("og:title") and f.og.get("og:description"))]
+        og_status = _ratio(len(og_bad), n)
+        if og_status == "present" and not home.og.get("og:image"):
+            og_status = "partial"
+        checks["open_graph"] = Check(
+            status=og_status, pages_checked=n, pages_affected=len(og_bad),
+            value=sorted(home.og.keys()),
+            details={"homepage_og_image": bool(home.og.get("og:image")), "examples_missing": _examples(og_bad)},
+            note=None if og_status == "present" else "Social shares fall back to platform defaults without og tags")
+
+        tw_bad = [f.url for f in facts if not f.twitter.get("twitter:card")]
+        checks["twitter_card"] = Check(status=_ratio(len(tw_bad), n), pages_checked=n,
+                                       pages_affected=len(tw_bad), value=home.twitter.get("twitter:card"))
+
+        no_h1 = [f.url for f in facts if f.h1_count == 0]
+        multi_h1 = [f.url for f in facts if f.h1_count > 1]
+        h1_status = "missing" if len(no_h1) == n else ("partial" if no_h1 or multi_h1 else "present")
+        checks["h1"] = Check(status=h1_status, value=home.h1, pages_checked=n,
+                             pages_affected=len(no_h1) + len(multi_h1),
+                             details={"missing": len(no_h1), "multiple": len(multi_h1),
+                                      "examples_missing": _examples(no_h1), "examples_multiple": _examples(multi_h1)})
+
+        skip_pages = [f.url for f in facts if f.heading_skips]
+        hh = _ratio(len(skip_pages), n)
+        checks["heading_hierarchy"] = Check(
+            status="partial" if hh == "missing" else hh, pages_checked=n, pages_affected=len(skip_pages),
+            details={"examples": _examples(skip_pages)},
+            note="Pages that jump heading levels (e.g. H2 -> H4)" if skip_pages else None)
+
+        total_img = sum(f.images_total for f in facts)
+        missing_alt = sum(f.images_missing_alt for f in facts)
+        alt_pages = [f.url for f in facts if f.images_missing_alt]
+        alt_status = "present" if total_img == 0 else _ratio(missing_alt, total_img)
+        checks["image_alt_text"] = Check(
+            status=alt_status, pages_checked=n, pages_affected=len(alt_pages),
+            details={"images_total": total_img, "images_missing_alt": missing_alt,
+                     "images_empty_alt": sum(f.images_empty_alt for f in facts),
+                     "examples": _examples(alt_pages)},
+            note="No <img> tags found" if total_img == 0 else
+            "Empty alt=\"\" is valid for decorative images and is not counted as missing")
+
+        type_counts = Counter(t for f in facts for t in f.schema_types)
+        posts = [f for f in facts if f.page_type == "blog_post"]
+        article_types = {"Article", "BlogPosting", "NewsArticle", "TechArticle"}
+        schema_status = "missing" if not type_counts else ("present" if home.schema_types else "partial")
+        checks["schema_markup"] = Check(
+            status=schema_status, value=home.schema_types,
+            pages_checked=n, pages_affected=sum(1 for f in facts if not f.schema_types),
+            details={"types_found": dict(type_counts.most_common()),
+                     "has_organization": any(t in type_counts for t in ("Organization", "LocalBusiness", "Corporation")),
+                     "has_website": "WebSite" in type_counts,
+                     "has_breadcrumbs": "BreadcrumbList" in type_counts,
+                     "blog_posts_with_article_schema": sum(1 for f in posts if article_types & set(f.schema_types)),
+                     "blog_posts_checked": len(posts),
+                     "invalid_jsonld_blocks": sum(f.jsonld_invalid for f in facts)})
+
+        no_canon = [f.url for f in facts if not f.canonical]
+        non_self = [f.url for f in facts if f.canonical and f.canonical_is_self is False]
+        cross = [f.url for f in facts if f.canonical and bare_host(urlparse(f.canonical).hostname)
+                 != bare_host(urlparse(f.url).hostname)]
+        checks["canonical"] = Check(
+            status=_ratio(len(no_canon), n), value=home.canonical, pages_checked=n,
+            pages_affected=len(no_canon),
+            details={"missing": len(no_canon), "non_self_referencing": len(non_self),
+                     "cross_domain": len(cross), "examples_missing": _examples(no_canon),
+                     "examples_non_self": _examples(non_self)})
+
+        noindex_pages = [f.url for f in facts if f.noindex]
+        g_blocked = bool(crawl.robots.blocks_googlebot)
+        if home.noindex or g_blocked:
+            idx_status = "missing"
+        else:
+            idx_status = "partial" if noindex_pages else "present"
+        checks["indexability"] = Check(
+            status=idx_status, value=not (home.noindex or g_blocked), pages_checked=n,
+            pages_affected=len(noindex_pages),
+            details={"homepage_noindex": home.noindex, "robots_blocks_googlebot": g_blocked,
+                     "noindex_pages": _examples(noindex_pages)},
+            note="Homepage cannot be indexed by Google" if idx_status == "missing" else None)
+
+        vp = (home.viewport or "").lower()
+        checks["mobile_viewport"] = Check(
+            status="present" if "width=device-width" in vp else ("partial" if vp else "missing"),
+            value=home.viewport)
+        checks["lang"] = Check(status="present" if home.lang else "missing", value=home.lang)
+        hl = sorted({h for f in facts for h in f.hreflang})
+        checks["hreflang"] = Check(status="present" if hl else "missing", value=hl,
+                                   note=None if hl else "Only needed for multi-language / multi-region sites (not scored)")
+
+        trackers: dict[str, set] = {}
+        for f in facts:
+            for k, ids in f.trackers.items():
+                trackers.setdefault(k, set()).update(ids)
+        tracker_out = {k: sorted(v) for k, v in sorted(trackers.items())}
+        checks["analytics"] = Check(status="present" if tracker_out else "missing", value=sorted(tracker_out),
+                                    details=tracker_out)
+
+        vendors = sorted({f.consent_vendor for f in facts if f.consent_vendor})
+        ad_trackers = [k for k in tracker_out if k not in ("plausible",)]
+        checks["cookie_banner"] = Check(
+            status="present" if vendors else "missing", value=vendors[0] if vendors else None,
+            details={"vendors": vendors, "trackers_loaded": ad_trackers,
+                     "tracking_without_detected_consent": bool(ad_trackers) and not vendors},
+            note="Detected from static HTML. Banners injected purely via JavaScript/GTM may be missed."
+            if not vendors else None)
+
+        checks["platform"] = Check(status="present" if home.platform else "missing", value=home.platform,
+                                   details={"generator": home.generator})
+
+    r = crawl.robots
+    robots_details = r.model_dump(exclude={"status"})
+    if r.status == "present":
+        bad = r.disallows_all or r.blocks_googlebot
+        checks["robots_txt"] = Check(status="partial" if bad else "present", value=r.url, details=robots_details,
+                                     note="robots.txt blocks crawlers from the homepage" if bad else None)
+    elif r.status == "missing":
+        checks["robots_txt"] = Check(status="missing", details=robots_details,
+                                     note="Crawlers treat a missing robots.txt as allow-all, but you lose the sitemap reference")
+    elif r.status == "error":
+        checks["robots_txt"] = Check(status="error", details=robots_details, note="robots.txt returned a 5xx error")
+    else:
+        checks["robots_txt"] = not_checked(r.status if r.status != "not_checked" else reason)
+
+    s = crawl.sitemap
+    sm_map = {"present": "present", "invalid": "partial", "missing": "missing"}
+    if s.status in sm_map:
+        checks["sitemap"] = Check(status=sm_map[s.status], value=s.url, details=s.model_dump(exclude={"status"}),
+                                  note="A file exists but it is not a valid XML sitemap" if s.status == "invalid" else None)
+    else:
+        checks["sitemap"] = not_checked(s.status if s.status != "not_checked" else reason)
+
+    h = crawl.https
+    if h is None:
+        checks["https"] = not_checked(reason)
+    elif h.final_scheme == "https":
+        checks["https"] = Check(
+            status="partial" if h.http_redirects_to_https is False else "present",
+            value=True, details=h.model_dump(),
+            note="HTTP version does not redirect to HTTPS" if h.http_redirects_to_https is False else None)
+    else:
+        checks["https"] = Check(status="missing", value=False, details=h.model_dump(),
+                                note="Site is served over plain HTTP" + (" (HTTPS has a certificate error)" if h.ssl_error else ""))
+
+    tech = TechnicalSEO(**checks)
+
+    types = Counter(f.page_type for f in facts)
+    thin = [f for f in facts if f.word_count < 300 and f.page_type not in ("contact", "legal")]
+    content = ContentStats(
+        pages_analyzed=len(facts),
+        avg_word_count=int(sum(f.word_count for f in facts) / len(facts)) if facts else 0,
+        thin_pages=len(thin), page_types=dict(types.most_common()),
+        blog_detected=bool(types.get("blog_index") or types.get("blog_post") or (s.blog_url_count or 0)),
+        blog_posts_crawled=types.get("blog_post", 0), sitemap_blog_urls=s.blog_url_count)
+    return tech, content
