@@ -9,7 +9,8 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from .schema import (Check, ContentStats, CrawlSummary, PageFacts, PageRecord, TechnicalSEO,
+from .locale import GENERIC_LAW, detect_language, primary, site_locale
+from .schema import (Check, ContentStats, CrawlSummary, Locale, PageFacts, PageRecord, TechnicalSEO,
                      not_checked)
 from .urlutils import bare_host, classify_path, normalize_url
 
@@ -232,6 +233,7 @@ def extract_page(url: str, final_url: Optional[str], html: str, headers: dict,
         meta_robots=meta_robots, x_robots_tag=x_robots,
         noindex=_has_directive(meta_robots, "noindex") or _has_directive(x_robots, "noindex"),
         lang=(soup.html.get("lang") if soup.html else None) or None,
+        content_language=detect_language(body_text),
         viewport=metas.get("viewport") or None, hreflang=hreflang, og=og, twitter=tw,
         h1=h1, h1_count=len(h1s), h2=h2, h3_count=len(soup.find_all("h3")), heading_skips=skips,
         word_count=word_count, images_total=len(imgs), images_missing_alt=missing_alt,
@@ -273,10 +275,36 @@ def _text_check(facts: list[PageFacts], home: PageFacts, attr: str, lo: int, hi:
                           "examples_missing": _examples(missing), "examples_too_long": _examples(too_long)})
 
 
-def rollup(records: list[PageRecord], crawl: CrawlSummary) -> tuple[TechnicalSEO, ContentStats]:
+def _broken_links(crawl: CrawlSummary) -> Check:
+    broken = crawl.broken_urls
+    checked = max(0, crawl.pages_attempted - 1)
+    if checked == 0:
+        return not_checked(crawl.reason or "no_pages_attempted")
+    sm = crawl.sitemap
+    from_sitemap = [b.url for b in broken if b.source in ("sitemap", "both")] + sm.probe_dead_examples
+    dead_in_sitemap = len(from_sitemap) - len(sm.probe_dead_examples) + sm.probe_dead
+    from_links = [b.url for b in broken if b.source in ("homepage_link", "both")]
+    fetched = crawl.sitemap_urls_fetched + sm.probe_checked
+    dead = len(broken) + sm.probe_dead
+    checked += sm.probe_checked
+    return Check(
+        status="partial" if dead else "present", value=dead, pages_checked=checked,
+        pages_affected=dead,
+        details={"in_sitemap": dead_in_sitemap, "linked_from_homepage": len(from_links),
+                 "sitemap_probe_checked": sm.probe_checked, "sitemap_probe_dead": sm.probe_dead,
+                 "sitemap_urls_fetched": fetched,
+                 "sitemap_dead_ratio": round(dead_in_sitemap / fetched, 2) if fetched else None,
+                 "examples_sitemap": _examples(from_sitemap), "examples_linked": _examples(from_links)},
+        note=(f"{dead} of {checked} URLs checked return 404/410. Only a sample was fetched, "
+              "so the site may have more") if dead else None)
+
+
+def rollup(records: list[PageRecord], crawl: CrawlSummary) -> tuple[TechnicalSEO, ContentStats, Locale]:
     facts = [r.facts for r in records if r.facts]
     home = records[0].facts if records and records[0].facts else None
     reason = crawl.reason or "no_usable_pages"
+    locale = site_locale(crawl.final_domain or "", home.lang if home else None,
+                         [f.content_language for f in facts], home.content_language if home else None)
 
     checks: dict[str, Check] = {}
     page_checks = ("meta_title", "meta_description", "open_graph", "twitter_card", "h1",
@@ -374,7 +402,16 @@ def rollup(records: list[PageRecord], crawl: CrawlSummary) -> tuple[TechnicalSEO
         checks["mobile_viewport"] = Check(
             status="present" if "width=device-width" in vp else ("partial" if vp else "missing"),
             value=home.viewport)
-        checks["lang"] = Check(status="present" if home.lang else "missing", value=home.lang)
+        mismatched = [f.url for f in facts if f.lang and f.content_language
+                      and primary(f.lang) != f.content_language]
+        home_mismatch = home.url in mismatched
+        lang_status = "missing" if not home.lang else ("partial" if mismatched else "present")
+        checks["lang"] = Check(
+            status=lang_status, value=home.lang, pages_checked=n, pages_affected=len(mismatched),
+            details={"content_language": locale.content_language, "homepage_mismatch": home_mismatch,
+                     "examples": _examples(mismatched)},
+            note=(f"lang attribute does not match the detected content language on "
+                  f"{len(mismatched)} page(s)") if mismatched else None)
         hl = sorted({h for f in facts for h in f.hreflang})
         checks["hreflang"] = Check(status="present" if hl else "missing", value=hl,
                                    note=None if hl else "Only needed for multi-language / multi-region sites (not scored)")
@@ -392,7 +429,8 @@ def rollup(records: list[PageRecord], crawl: CrawlSummary) -> tuple[TechnicalSEO
         checks["cookie_banner"] = Check(
             status="present" if vendors else "missing", value=vendors[0] if vendors else None,
             details={"vendors": vendors, "trackers_loaded": ad_trackers,
-                     "tracking_without_detected_consent": bool(ad_trackers) and not vendors},
+                     "tracking_without_detected_consent": bool(ad_trackers) and not vendors,
+                     "privacy_law": locale.privacy_law or GENERIC_LAW},
             note="Detected from static HTML. Banners injected purely via JavaScript/GTM may be missed."
             if not vendors else None)
 
@@ -433,6 +471,7 @@ def rollup(records: list[PageRecord], crawl: CrawlSummary) -> tuple[TechnicalSEO
         checks["https"] = Check(status="missing", value=False, details=h.model_dump(),
                                 note="Site is served over plain HTTP" + (" (HTTPS has a certificate error)" if h.ssl_error else ""))
 
+    checks["broken_links"] = _broken_links(crawl)
     tech = TechnicalSEO(**checks)
 
     types = Counter(f.page_type for f in facts)
@@ -443,4 +482,4 @@ def rollup(records: list[PageRecord], crawl: CrawlSummary) -> tuple[TechnicalSEO
         thin_pages=len(thin), page_types=dict(types.most_common()),
         blog_detected=bool(types.get("blog_index") or types.get("blog_post") or (s.blog_url_count or 0)),
         blog_posts_crawled=types.get("blog_post", 0), sitemap_blog_urls=s.blog_url_count)
-    return tech, content
+    return tech, content, locale

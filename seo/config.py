@@ -15,6 +15,8 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 @dataclass
 class CrawlConfig:
     max_pages: int = 15
+    max_fetch_attempts: int = 40
+    sitemap_probe: int = 10
     per_domain_concurrency: int = 2
     delay_seconds: float = 1.0
     request_timeout: float = 15.0

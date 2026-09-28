@@ -17,7 +17,7 @@ from bs4 import BeautifulSoup
 
 from .blockers import detect_blocker, has_hard_block_signal, page_flags
 from .config import CrawlConfig
-from .schema import BlockerCount, CrawlSummary, HttpsInfo, PageFetch, RobotsInfo, SitemapInfo
+from .schema import BlockerCount, BrokenURL, CrawlSummary, HttpsInfo, PageFetch, RobotsInfo, SitemapInfo
 from .urlutils import (bare_host, classify_path, in_scope, is_crawlable, normalize_input,
                        normalize_url, origin_candidates, origin_of, site_key)
 
@@ -26,6 +26,7 @@ log = logging.getLogger(__name__)
 REDIRECT_CODES = {301, 302, 303, 307, 308}
 RETRYABLE = {429, 500, 502, 503, 504}
 NETWORK_ERRORS = {"dns_error", "ssl_error", "connect_error", "timeout"}
+DEAD_CODES = {404, 410}
 
 
 @dataclass
@@ -53,13 +54,15 @@ class FetchResult:
     blocker: Optional[str] = None
     error: Optional[str] = None
     flags: list = field(default_factory=list)
+    source: Optional[str] = None
     soup: Any = field(default=None, repr=False)
 
     def to_model(self) -> PageFetch:
         return PageFetch(url=self.url, final_url=self.final_url, status_code=self.status_code,
                          outcome=self.outcome, blocker=self.blocker, error=self.error,
                          content_type=self.content_type or None, bytes=self.size,
-                         elapsed_ms=self.elapsed_ms, redirects=self.redirects, flags=self.flags)
+                         elapsed_ms=self.elapsed_ms, redirects=self.redirects, flags=self.flags,
+                         source=self.source)
 
     def to_cache(self) -> dict:
         return {**self.to_model().model_dump(), "headers": self.headers}
@@ -70,7 +73,7 @@ class FetchResult:
                    headers=d.get("headers") or {}, text=text, content_type=d.get("content_type") or "",
                    size=d.get("bytes", 0), redirects=d.get("redirects") or [],
                    elapsed_ms=d.get("elapsed_ms", 0), outcome=d["outcome"], blocker=d.get("blocker"),
-                   error=d.get("error"), flags=d.get("flags") or [])
+                   error=d.get("error"), flags=d.get("flags") or [], source=d.get("source"))
 
 
 @dataclass
@@ -126,6 +129,10 @@ class CrawlResult:
             pages_failed=sum(p.outcome == "failed" for p in self.pages),
             pages_skipped=sum(p.outcome == "skipped" for p in self.pages),
             blockers=[BlockerCount(type=t, count=c) for t, c in blockers.most_common()],
+            broken_urls=[BrokenURL(url=p.url, status_code=p.status_code, source=p.source)
+                         for p in self.pages if p.outcome == "failed" and p.status_code in DEAD_CODES],
+            sitemap_urls_fetched=sum(p.source in ("sitemap", "both") and p.outcome != "skipped"
+                                     for p in self.pages),
             flags=flags, budget_exceeded=self.budget_exceeded, stopped_early=self.stopped_early,
             robots=self.robots, sitemap=self.sitemap, https=self.https,
             duration_seconds=self.duration_seconds, user_agent=self.user_agent)
@@ -228,8 +235,12 @@ def parse_sitemap(body: bytes) -> Optional[tuple[bool, list[str]]]:
     return None
 
 
-def select_pages(home: FetchResult, sitemap_urls: list[str], base_host: str, cfg: CrawlConfig) -> list[str]:
-    """Rank candidate URLs so the 10-20 crawled pages are the ones that matter."""
+def select_pages(home: FetchResult, sitemap_urls: list[str], base_host: str,
+                 cfg: CrawlConfig) -> list[tuple[str, str]]:
+    """Rank candidate URLs, best first, as (url, source) with source = homepage_link | sitemap | both.
+
+    Returns more than max_pages candidates so dead URLs can be replaced during the crawl.
+    """
     home_norm = normalize_url(home.final_url)
     stats: dict[str, dict] = {}
 
@@ -250,10 +261,12 @@ def select_pages(home: FetchResult, sitemap_urls: list[str], base_host: str, cfg
             s["nav"] = True
         if not s["anchor"]:
             s["anchor"] = a.get_text(" ", strip=True)[:80]
+    in_sitemap = set()
     for raw in sitemap_urls:
         u = normalize_url(raw)
         if ok(u):
             stats.setdefault(u, {"count": 0, "nav": False, "anchor": ""})
+            in_sitemap.add(u)
 
     scored = []
     for u, s in stats.items():
@@ -270,10 +283,9 @@ def select_pages(home: FetchResult, sitemap_urls: list[str], base_host: str, cfg
 
     slots = max(0, cfg.max_pages - 1)
     max_posts = max(2, int(slots * 0.4))
+    min_posts = min(2, max_posts)
     chosen, posts, legal = [], 0, 0
     for _, ptype, u in scored:
-        if len(chosen) >= slots:
-            break
         if ptype == "blog_post":
             if posts >= max_posts:
                 continue
@@ -282,8 +294,22 @@ def select_pages(home: FetchResult, sitemap_urls: list[str], base_host: str, cfg
             if legal >= 1:
                 continue
             legal += 1
-        chosen.append(u)
-    return chosen
+        linked = stats[u]["count"] > 0
+        chosen.append((u, ptype, "both" if linked and u in in_sitemap else ("homepage_link" if linked else "sitemap")))
+    reserved = [c for c in chosen if c[1] == "blog_post"][:min_posts]
+    rest = [c for c in chosen if c not in reserved]
+    head = max(0, slots - len(reserved))
+    ordered = rest[:head] + reserved + rest[head:]
+    return [(u, src) for u, _, src in ordered[:max(slots, cfg.max_fetch_attempts)]]
+
+
+def probe_sample(urls: list[str], exclude: set[str], n: int) -> list[str]:
+    """Up to n URLs spread evenly across the sitemap, skipping ones already fetched."""
+    pool = [u for u in dict.fromkeys(urls) if u not in exclude]
+    if n <= 0 or not pool:
+        return []
+    step = max(1, len(pool) // n)
+    return pool[::step][:n]
 
 
 class _SiteSession:
@@ -494,25 +520,35 @@ class _SiteSession:
         return SitemapInfo(status="invalid" if invalid_url else "missing", url=invalid_url,
                            declared_in_robots=bool(declared)), []
 
-    async def _crawl_pages(self, urls: list[str], result: CrawlResult, base_host: str, t0: float) -> None:
+    async def _crawl_pages(self, urls: list[tuple[str, str]], result: CrawlResult, base_host: str,
+                           t0: float) -> None:
+        """Fetch candidates in rank order until max_pages usable pages or max_fetch_attempts fetches."""
         queue = list(urls)
         seen_final = {normalize_url(result.pages[0].final_url)}
-        state = {"stop": None, "rate_limited": 0}
+        state = {"stop": None, "rate_limited": 0, "ok": 0, "inflight": 0, "fetched": 0}
+        target = max(0, self.cfg.max_pages - 1)
 
         async def worker():
-            while queue and not state["stop"]:
+            while (queue and not state["stop"] and state["ok"] + state["inflight"] < target
+                   and state["fetched"] < self.cfg.max_fetch_attempts):
                 if time.monotonic() - t0 > self.cfg.site_time_budget:
                     result.budget_exceeded = "time"
                     return
                 if self.bytes_total > self.cfg.max_site_bytes:
                     result.budget_exceeded = "bytes"
                     return
-                url = queue.pop(0)
+                url, source = queue.pop(0)
                 if not self._allowed(url):
-                    result.pages.append(FetchResult(url=url, outcome="skipped", error="robots_disallowed"))
+                    result.pages.append(FetchResult(url=url, outcome="skipped", error="robots_disallowed",
+                                                    source=source))
                     continue
-                r = await self.fetch(url)
-                r.soup = None
+                state["inflight"] += 1
+                state["fetched"] += 1
+                try:
+                    r = await self.fetch(url)
+                finally:
+                    state["inflight"] -= 1
+                r.soup, r.source = None, source
                 if r.outcome == "ok" and r.final_url:
                     fn = normalize_url(r.final_url)
                     if not in_scope(r.final_url, base_host, self.cfg.include_subdomains):
@@ -521,6 +557,7 @@ class _SiteSession:
                         r.outcome, r.error, r.text, r.body = "skipped", "duplicate", "", b""
                     else:
                         seen_final.add(fn)
+                        state["ok"] += 1
                 result.pages.append(r)
                 if r.blocker in ("anti_bot", "captcha"):
                     state["stop"] = r.blocker
@@ -584,7 +621,28 @@ class _SiteSession:
         candidates = select_pages(home, sitemap_urls, base_host, self.cfg)
         log.info("%s: %d candidate pages selected", result.final_domain, len(candidates))
         await self._crawl_pages(candidates, result, base_host, t0)
+        if not result.stopped_early:
+            await self._probe_sitemap(sitemap_urls, result, base_host, t0)
         return result.finalize(t0)
+
+    async def _probe_sitemap(self, sitemap_urls: list[str], result: CrawlResult, base_host: str,
+                             t0: float) -> None:
+        """Status-check a spread-out sample of sitemap URLs to estimate how many are dead. Not analyzed."""
+        fetched = {normalize_url(p.url) for p in result.pages}
+        in_site = [u for u in (normalize_url(x) for x in sitemap_urls)
+                   if u and in_scope(u, base_host, self.cfg.include_subdomains)]
+        sm = result.sitemap
+        for url in probe_sample(in_site, fetched, self.cfg.sitemap_probe):
+            if time.monotonic() - t0 > self.cfg.site_time_budget or not self._allowed(url):
+                break
+            r = await self.fetch(url, kind="raw")
+            if r.outcome == "blocked":
+                break
+            sm.probe_checked += 1
+            if r.status_code in DEAD_CODES:
+                sm.probe_dead += 1
+                if len(sm.probe_dead_examples) < 5:
+                    sm.probe_dead_examples.append(url)
 
 
 class Crawler:

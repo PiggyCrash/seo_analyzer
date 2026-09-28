@@ -7,12 +7,13 @@ import logging
 import os
 import re
 import time
+from datetime import date, datetime, timezone
 from typing import Optional
 
 from pydantic import ValidationError
 
 from .config import LLMConfig
-from .schema import ContentStats, CrawlSummary, LLMOutput, PageRecord, QuickWin, TechnicalSEO
+from .schema import ContentStats, CrawlSummary, LLMOutput, Locale, PageRecord, QuickWin, TechnicalSEO
 
 log = logging.getLogger(__name__)
 
@@ -71,8 +72,15 @@ SYSTEM_PROMPT = """You are a senior SEO analyst. You receive a JSON digest of fa
 
 Rules:
 - The digest facts are ground truth. Never contradict them and never invent technical findings.
-- `rule_based_quick_wins` were already generated from the facts. Do NOT repeat them. Your quick_wins must focus on content, keywords, positioning, conversion and strategy, or issues the rules cannot express.
+- `rule_based_quick_wins` were already generated from the facts. Do NOT repeat or rephrase them. Your quick_wins must focus on content, keywords, positioning, conversion and strategy, or issues the rules cannot express.
 - You have NO search-volume, ranking or backlink data. Keywords are hypotheses inferred from the site's content; phrase rationales accordingly.
+- Write all prose (summary, assessments, actions, rationales) in English. Only keywords go in the audience's language.
+- Use `context`. Today is `context.analysis_date`: never put a past year in a keyword or recommendation. Write for `context.country` and the audience's language (`context.content_language`); suggest keywords in the language that audience searches in. Cite only `context.privacy_law` or other laws/regulators of that country, never another country's.
+- `context.sample` says how many pages you saw out of how many the sitemap lists. When the sample is small, qualify site-wide statements ("in the N pages sampled") instead of asserting them for the whole site.
+- Respect what the facts say does NOT exist. If `content_stats.blog_detected` is false, do not treat the site as having blog posts; "create a blog/news section" is a separate, high-effort project.
+- Every quick win MUST include `evidence`: the specific URL, title, heading, excerpt phrase or measured value in the digest that motivates it. The evidence must actually support the action (e.g. do not recommend translating text that is already in the audience's language). Quick wins without concrete evidence are discarded.
+- Do not propose features the site gives no sign of offering (live chat, appointment booking, e-commerce, etc.). Suggestions must fit what this organisation actually does, as shown in the digest.
+- effort: low = under a day of work, medium = a few days, high = weeks or a new site section. Rank honestly.
 - Be specific to THIS site and its niche. No generic filler.
 - Output ONLY one JSON object. No markdown, no code fences, no commentary.
 
@@ -80,18 +88,54 @@ Required JSON shape:
 {
   "company": "company/brand name or null",
   "sector": "short sector description",
-  "summary": "2-3 sentence overall SEO assessment",
+  "summary": "2-3 sentence overall SEO assessment, mentioning the sample size if it is small",
   "keyword_strategy": "how the site currently targets search, if at all",
   "captured_keywords": ["3-8 keywords/topics the site already targets, evidenced by titles, headings or copy"],
   "missed_keywords": [{"keyword": "string", "intent": "informational|commercial|transactional|navigational", "rationale": "why it fits this site"}],
   "content_assessment": "quality, depth and originality of the content",
   "competitive_position": "likely organic position and opportunity in its niche",
-  "quick_wins": [{"action": "string", "priority": "high|medium|low", "effort": "low|medium|high", "category": "content|keywords|technical|compliance|social|conversion|other", "rationale": "string"}]
+  "quick_wins": [{"action": "string", "priority": "high|medium|low", "effort": "low|medium|high", "category": "content|keywords|technical|compliance|social|conversion|other", "rationale": "string", "evidence": "string"}]
 }
 Give 5-10 missed_keywords and 3-7 quick_wins."""
 
+_YEAR = re.compile(r"\b(19|20)\d{2}\b")
 
-def build_digest(site: str, crawl: CrawlSummary, tech: TechnicalSEO, content: ContentStats,
+
+RULE_TOPICS = {
+    "meta_title": re.compile(r"<title>|\btitle tags?\b|\bmeta titles?\b|\btitles?\b.*\b(unique|length|characters|translate)", re.I),
+    "meta_description": re.compile(r"meta descriptions?", re.I),
+    "h1": re.compile(r"\bh1\b", re.I),
+    "image_alt_text": re.compile(r"\balt (text|attributes?)\b", re.I),
+    "robots_txt": re.compile(r"robots\.txt", re.I),
+    "schema_markup": re.compile(r"organization (schema|json-ld)|website (schema|json-ld)", re.I),
+    "lang": re.compile(r"lang attribute|<html lang", re.I),
+    "cookie_banner": re.compile(r"consent banner|cookie banner", re.I),
+    "canonical": re.compile(r"canonical", re.I),
+    "open_graph": re.compile(r"open graph|og:", re.I),
+    "broken_links": re.compile(r"dead (urls?|links?)|broken links?|\b404\b", re.I),
+}
+
+
+def clean_output(out: LLMOutput, today: date, rule_checks: frozenset[str] = frozenset()) -> LLMOutput:
+    """Drop what the prompt forbids but models still produce: evidence-free wins, stale-year keywords,
+    and wins that restate a rule-based quick win."""
+    def stale(text: str) -> bool:
+        return any(int(m.group(0)) < today.year for m in _YEAR.finditer(text or ""))
+
+    def repeats_rule(action: str) -> bool:
+        return any(RULE_TOPICS[c].search(action) for c in rule_checks if c in RULE_TOPICS)
+
+    wins = [q for q in out.quick_wins
+            if (q.evidence or "").strip() and not stale(q.action) and not repeats_rule(q.action)]
+    kws = [k for k in out.missed_keywords if not stale(k.keyword)]
+    dropped = len(out.quick_wins) - len(wins), len(out.missed_keywords) - len(kws)
+    if any(dropped):
+        log.info("dropped %d LLM quick win(s) (no evidence, stale year or repeats a rule), %d stale keyword(s)",
+                 *dropped)
+    return out.model_copy(update={"quick_wins": wins, "missed_keywords": kws})
+
+
+def build_digest(site: str, crawl: CrawlSummary, tech: TechnicalSEO, content: ContentStats, locale: Locale,
                  records: list[PageRecord], rule_wins: list[QuickWin], max_chars: int) -> dict:
     checks = {}
     for name, c in tech:
@@ -110,12 +154,21 @@ def build_digest(site: str, crawl: CrawlSummary, tech: TechnicalSEO, content: Co
         f = r.facts
         if not f:
             continue
-        pages.append({"url": f.url, "type": f.page_type, "title": f.title, "meta_description": f.meta_description,
-                      "h1": f.h1[:2], "h2": f.h2[:8], "word_count": f.word_count, "schema_types": f.schema_types})
+        pages.append({"url": f.url, "type": f.page_type, "lang": f.lang, "content_language": f.content_language,
+                      "title": f.title, "meta_description": f.meta_description,
+                      "h1": f.h1[:2], "h2": f.h2[:8], "word_count": f.word_count,
+                      "internal_links": f.internal_links, "schema_types": f.schema_types})
         excerpts.append(f.text_excerpt)
 
     digest = {
         "site": site,
+        "context": {
+            "analysis_date": datetime.now(timezone.utc).date().isoformat(),
+            "country": locale.country, "content_language": locale.content_language,
+            "html_lang": locale.html_lang, "privacy_law": locale.privacy_law,
+            "sample": {"pages_analyzed": content.pages_analyzed, "sitemap_urls": crawl.sitemap.url_count,
+                       "broken_urls_found": len(crawl.broken_urls)},
+        },
         "crawl": {"status": crawl.status, "pages_ok": crawl.pages_ok, "flags": crawl.flags,
                   "blockers": [b.model_dump() for b in crawl.blockers]},
         "technical_checks": checks,
@@ -226,16 +279,17 @@ class LLMAnalyzer:
                 raise
         return resp.choices[0].message.content or ""
 
-    async def analyze(self, digest: dict) -> LLMOutput:
+    async def analyze(self, digest: dict, rule_checks: frozenset[str] = frozenset()) -> LLMOutput:
         messages = [{"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": json.dumps(digest, ensure_ascii=False)}]
         raw = await self._chat(messages)
+        today = date.fromisoformat(digest["context"]["analysis_date"])
         try:
-            return LLMOutput.model_validate(_extract_json(raw))
+            return clean_output(LLMOutput.model_validate(_extract_json(raw)), today, rule_checks)
         except (ValueError, ValidationError) as exc:
             log.warning("invalid LLM JSON, asking for a correction: %s", str(exc)[:200])
             messages += [{"role": "assistant", "content": raw},
                          {"role": "user", "content": f"That response was invalid: {str(exc)[:800]}\n"
                                                      "Return ONLY the corrected JSON object."}]
             raw = await self._chat(messages)
-            return LLMOutput.model_validate(_extract_json(raw))
+            return clean_output(LLMOutput.model_validate(_extract_json(raw)), today, rule_checks)

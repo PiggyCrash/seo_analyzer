@@ -58,9 +58,13 @@ cache/<site>/<timestamp>/              raw HTML + crawl metadata (used by --rean
 
 Each check has a fixed `status`: `present | partial | missing | not_checked | error`. `not_checked` always comes with a `reason`. **A blocked page is never reported as "missing".** Each report records `schema_version`, `tool_version` and the model used, so runs stay comparable.
 
-The score is computed from weighted checks (`seo/scoring.py`) and is reproducible. If less than 50% of the weighted checks could be verified, the score is `null` with the label "Insufficient data".
+The score is computed from weighted checks (`seo/scoring.py`) and is reproducible. If less than 50% of the weighted checks could be verified, the score is `null` with the label "Insufficient data". It also has a `confidence` (`high` ≥10 pages, `medium` ≥5, `low` below that) and `caveats`, and the summary's `overall_rating` says LOW CONFIDENCE when only a few pages loaded. It measures technical hygiene only, not content quality or rankings.
 
-Quick wins have `source: "rule"` (derived from the facts) or `source: "llm"` (strategy/content), plus `priority`, `effort` and `category`. LLM keyword suggestions are tagged `llm_suggested` because they are hypotheses, not search-volume data.
+Each report has a `locale` (country from the TLD, or from the detected content language, plus the matching privacy law, e.g. `.co.id` → UU PDP, `.sg` → PDPA, EU → GDPR). The cookie-banner finding and the LLM prompt both use it. The `lang` check compares `<html lang>` with the detected content language, and `broken_links` reports 404/410 URLs among the crawled pages plus a spread-out sample of sitemap URLs.
+
+Quick wins have `source: "rule"` (derived from the facts) or `source: "llm"` (strategy/content), plus `priority`, `effort` and `category`. The summary lists them ranked by priority and effort, with high-effort work under `larger_projects`. LLM keyword suggestions are tagged `llm_suggested` because they are hypotheses, not search-volume data.
+
+The LLM receives today's date, the country, the content language, the privacy law and the sample size. Its output is filtered afterwards: quick wins without `evidence` from the digest, wins that restate a rule-based win, and keywords or wins containing a past year are dropped.
 
 ## When the API key runs out
 
@@ -95,7 +99,7 @@ It **detects and records blockers without bypassing them**:
 
 Crawl `status`: `ok | partial | blocked | failed`. The LLM is skipped when the homepage is unusable or fewer than `min_ok_pages` pages came back, so no tokens are spent analyzing a challenge page.
 
-Page selection ranks about / services / pricing / contact / blog / case-study pages first. It caps blog posts at about 40% of slots and skips login, cart, tag, pagination, file and tracking-parameter URLs.
+Page selection ranks about / services / pricing / contact / blog / case-study pages first (English and Indonesian URL words; a leading locale segment such as `/id/` or `/en-GB/` is ignored). It caps blog posts at about 40% of slots, reserves 2 slots for blog posts when any exist, and skips login, cart, tag, pagination, file and tracking-parameter URLs. Dead or failing candidates are replaced by the next-ranked URL until `max_pages` usable pages are collected or `max_fetch_attempts` fetches are used. Afterwards, up to `sitemap_probe` extra sitemap URLs are status-checked (not analyzed) to estimate how many are dead.
 
 ## Offline test site
 
@@ -116,6 +120,7 @@ seo/crawler.py     fetching, robots, sitemap, page selection, retries, budgets
 seo/blockers.py    blocker + flag detection
 seo/extractor.py   per-page facts and site rollup into checks
 seo/scoring.py     weighted score + rule-based quick wins
+seo/locale.py      content language, country, privacy law
 seo/llm.py         Cerebras client, prompt, digest, JSON repair
 seo/schema.py      Pydantic models = the JSON contract
 seo/storage.py     reports, history, index, crawl cache

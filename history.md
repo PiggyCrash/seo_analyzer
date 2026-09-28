@@ -1,5 +1,40 @@
 # History
 
+## 2026-09-28: Interpretation-layer fixes (Kimia Farma review)
+
+### Requirements
+
+- Fix the review points on the Kimia Farma report: 3-page sample, BlogPosting win with no blog, a 68 score that looked too high, PDPA on an Indonesian site, a "2024" keyword in a 2026 report, generic and unranked quick wins
+- Keep the same model (`openai/gpt-oss-120b` on Groq)
+
+### Problems found and solutions applied
+
+| Problem | Cause | Solution |
+|---|---|---|
+| Only 3 of 15 pages analyzed | `classify_path` matched words anywhere in the URL, so dead sitemap news slugs (`/en-GB/read/company-...`, `...-products-...`) ranked as about/service pages above ~80 real homepage links | Ignore locale prefixes, detect `/read/`, `/berita/` etc. as news, add Indonesian page words, replace dead URLs with the next candidate (`max_fetch_attempts`) |
+| Dead sitemap URLs not reported | No check for them | New `broken_links` check (weight 5) + sitemap probe (`sitemap_probe`) + rule quick win |
+| BlogPosting schema recommended with no blog | Fixed rule text | Only mentions blog posts when a blog is detected |
+| PDPA cited for Indonesia | Hard-coded "PDPA / GDPR" | `seo/locale.py` picks the law by country (ID → UU PDP) |
+| `lang="en"` on Indonesian content marked OK | No content-language check | Stopword language detection; `lang` becomes partial on mismatch + rule win |
+| "vaksin ... 2024" keyword | Prompt had no date/country | Digest `context` with date, country, language, privacy law, sample size; post-filter drops past-year keywords |
+| Generic filler wins | No grounding requirement | Wins must include `evidence`; wins without it or repeating a rule are dropped |
+| Big projects next to 5-minute fixes | Summary kept only the action text | Summary quick wins keep priority/effort/category/source; high-effort items go to `larger_projects` |
+| Score looked authoritative on 3 pages | No confidence | `score.confidence`, `pages_scored`, `caveats`; LOW CONFIDENCE in `overall_rating` |
+| LLM wrote the report in Indonesian | "write for the audience's language" | Prose in English, keywords in the audience's language |
+| Awards page classified as pricing | "harga" matched inside "penghargaan" | Removed "harga" |
+
+### Kimia Farma result
+
+| | Before | After |
+|---|---|---|
+| Pages analyzed | 3 | 15 (+1 blog post) |
+| Score | 68 Fair, no confidence | 66 Fair, high confidence |
+| Dead URLs | Not reported | 10 of 17 sitemap URLs checked return 404 |
+| Privacy law | PDPA / GDPR | UU PDP (Law No. 27/2022) |
+| Lang | "present" | Mismatch: declared `en`, content `id` |
+
+Schema version 1.1, tool version 1.1.0. Old reports still load in the summary.
+
 ## 2026-09-27: First test run, LLM provider switch, quota notice
 
 ### Requirements

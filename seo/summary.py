@@ -2,7 +2,7 @@
 
 The full SiteReport (every check, crawl detail and page) stays in output/history/.
 This module turns it into a short summary: one sentence per check, keyword lists
-as plain strings, and quick wins as a list of actions.
+as plain strings, and quick wins ranked by priority/effort (large projects listed separately).
 """
 from __future__ import annotations
 
@@ -88,7 +88,7 @@ def _alt(c: dict) -> str:
 def _schema(c: dict) -> str:
     d = c["details"]
     if c["status"] == "missing":
-        return "NONE — no Organization, WebSite or Article JSON-LD found — a significant gap"
+        return "NONE — no JSON-LD / structured data found on any crawled page — a significant gap"
     types = ", ".join(d.get("types_found", {})) or "none"
     gaps = [name for key, name in (("has_organization", "Organization"), ("has_website", "WebSite"))
             if not d.get(key)]
@@ -176,9 +176,32 @@ def _cookie(c: dict) -> str:
     if c["status"] == "present":
         return f"Present ({c.get('value')})"
     if d.get("tracking_without_detected_consent"):
-        return ("Not detected — tracking loads without consent, potential PDPA / GDPR compliance gap "
+        law = d.get("privacy_law") or "privacy law"
+        return (f"Not detected — tracking loads without consent, potential {law} compliance gap "
                 "(banners injected via JavaScript may be missed)")
     return "Not detected (no ad/analytics trackers either)"
+
+
+def _lang(c: dict) -> str:
+    d = c["details"]
+    detected = f", content detected as '{d['content_language']}'" if d.get("content_language") else ""
+    if c["status"] == "missing":
+        return f"MISSING <html lang>{detected}"
+    if c["status"] == "partial":
+        return f"MISMATCH — declared '{c.get('value')}'{detected} ({_plural(c.get('pages_affected') or 0, 'page')})"
+    return f"'{c.get('value')}'{detected}"
+
+
+def _broken(c: dict) -> str:
+    d = c["details"]
+    if c["status"] == "present":
+        return f"None found in {_plural(c.get('pages_checked') or 0, 'crawled URL')}"
+    parts = []
+    if d.get("in_sitemap"):
+        parts.append(f"{d['in_sitemap']} of {d['sitemap_urls_fetched']} sitemap URLs fetched")
+    if d.get("linked_from_homepage"):
+        parts.append(f"{d['linked_from_homepage']} linked from the homepage")
+    return f"{_plural(c.get('value') or 0, 'URL')} return 404/410 ({'; '.join(parts)}) — sample only"
 
 
 def _indexability(c: dict) -> str:
@@ -207,6 +230,8 @@ FORMATTERS = (
     ("mobile", "mobile_viewport", lambda c, _: _mobile(c)),
     ("platform", "platform", lambda c, _: _platform(c)),
     ("cookie_banner", "cookie_banner", lambda c, _: _cookie(c)),
+    ("lang", "lang", lambda c, _: _lang(c)),
+    ("broken_links", "broken_links", lambda c, _: _broken(c)),
 )
 
 
@@ -223,7 +248,14 @@ def _rating(report: dict) -> str:
     if score["value"] is None:
         why = crawl.get("reason") or crawl["status"]
         return f"{score['label']} (crawl {crawl['status']}: {why})"
-    rating = f"{score['label']} ({score['value']}/100)"
+    conf = score.get("confidence")
+    if conf in ("low", "none"):
+        rating = (f"{score['label']} ({score['value']}/100, LOW CONFIDENCE — only "
+                  f"{_plural(score.get('pages_scored') or 0, 'page')} analyzed)")
+    elif conf:
+        rating = f"{score['label']} ({score['value']}/100, {conf} confidence, {score['pages_scored']} pages)"
+    else:
+        rating = f"{score['label']} ({score['value']}/100)"
     summary = report["llm_analysis"].get("summary")
     return f"{rating} — {summary}" if summary else rating
 
@@ -239,6 +271,25 @@ def _blog(report: dict) -> str:
     return f"{blog} — {assessment}" if assessment else blog
 
 
+def _coverage(report: dict) -> str:
+    crawl, cs = report["crawl"], report["content_stats"]
+    total = crawl.get("sitemap", {}).get("url_count")
+    text = f"{cs['pages_analyzed']} pages analyzed" + (f" of {total} URLs in the sitemap" if total else "")
+    text += f"; {crawl['pages_attempted']} fetched, {crawl['pages_failed']} failed"
+    if crawl.get("pages_blocked"):
+        text += f", {crawl['pages_blocked']} blocked"
+    return text
+
+
+def _wins(report: dict) -> tuple[list[dict], list[dict]]:
+    quick, projects = [], []
+    for q in report["quick_wins"]:
+        item = {"action": q["action"], "priority": q["priority"], "effort": q["effort"],
+                "category": q["category"], "source": q["source"]}
+        (projects if q["effort"] == "high" else quick).append(item)
+    return quick, projects
+
+
 def _llm_missing(llm: dict) -> str:
     return f"Not analyzed (LLM {llm['status']}" + (f": {llm['reason']})" if llm.get("reason") else ")")
 
@@ -249,18 +300,25 @@ def summarize(report: dict) -> dict[str, Any]:
     home_h2 = _home_h2(report)
     technical = {}
     for out_key, check_key, fmt in FORMATTERS:
-        c = tech[check_key]
+        c = tech.get(check_key)
+        if c is None:
+            continue
         technical[out_key] = _not_verified(c) or fmt(c, home_h2)
 
     llm_ok = llm["status"] == "ok"
     cs = report["content_stats"]
+    quick, projects = _wins(report)
+    loc = report.get("locale") or {}
     return {
         "site": report["site"],
         "company": report.get("company"),
         "analysis_type": "SEO Analysis",
         "sector": report.get("sector"),
         "analyzed_at": report["analyzed_at"],
+        "country": loc.get("country"),
+        "data_coverage": _coverage(report),
         "overall_rating": _rating(report),
+        "score_caveats": report["score"].get("caveats") or [],
         "technical_seo": technical,
         "content_seo": {
             "keyword_strategy": llm.get("keyword_strategy") if llm_ok else _llm_missing(llm),
@@ -271,5 +329,6 @@ def summarize(report: dict) -> dict[str, Any]:
             "blog": _blog(report),
         },
         "competitive_seo_position": llm.get("competitive_position") if llm_ok else _llm_missing(llm),
-        "quick_wins": [q["action"] for q in report["quick_wins"]],
+        "quick_wins": quick,
+        "larger_projects": projects,
     }

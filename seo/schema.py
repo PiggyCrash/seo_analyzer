@@ -6,7 +6,7 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 CheckStatus = Literal["present", "missing", "partial", "not_checked", "error"]
 
@@ -50,6 +50,7 @@ class TechnicalSEO(BaseModel):
     analytics: Check
     cookie_banner: Check
     platform: Check
+    broken_links: Check
 
 
 class RobotsInfo(BaseModel):
@@ -71,6 +72,15 @@ class SitemapInfo(BaseModel):
     is_index: Optional[bool] = None
     child_sitemaps: Optional[int] = None
     declared_in_robots: bool = False
+    probe_checked: int = 0
+    probe_dead: int = 0
+    probe_dead_examples: list[str] = Field(default_factory=list)
+
+
+class BrokenURL(BaseModel):
+    url: str
+    status_code: Optional[int] = None
+    source: Optional[str] = None
 
 
 class HttpsInfo(BaseModel):
@@ -98,6 +108,8 @@ class CrawlSummary(BaseModel):
     pages_failed: int = 0
     pages_skipped: int = 0
     blockers: list[BlockerCount] = Field(default_factory=list)
+    broken_urls: list[BrokenURL] = Field(default_factory=list)
+    sitemap_urls_fetched: int = 0
     flags: list[str] = Field(default_factory=list)
     budget_exceeded: Optional[str] = None
     stopped_early: Optional[str] = None
@@ -120,6 +132,7 @@ class PageFetch(BaseModel):
     elapsed_ms: int = 0
     redirects: list[str] = Field(default_factory=list)
     flags: list[str] = Field(default_factory=list)
+    source: Optional[str] = None
 
 
 class PageFacts(BaseModel):
@@ -135,6 +148,7 @@ class PageFacts(BaseModel):
     x_robots_tag: Optional[str] = None
     noindex: bool = False
     lang: Optional[str] = None
+    content_language: Optional[str] = None
     viewport: Optional[str] = None
     hreflang: list[str] = Field(default_factory=list)
     og: dict[str, str] = Field(default_factory=dict)
@@ -186,6 +200,9 @@ class Score(BaseModel):
     value: Optional[int] = None
     label: str
     coverage: float = 0.0
+    pages_scored: int = 0
+    confidence: Literal["high", "medium", "low", "none"] = "none"
+    caveats: list[str] = Field(default_factory=list)
     breakdown: dict[str, ScoreItem] = Field(default_factory=dict)
 
 
@@ -217,6 +234,7 @@ class QuickWin(BaseModel):
     category: Literal["technical", "content", "keywords", "compliance", "social",
                       "conversion", "performance", "other"] = "other"
     rationale: Optional[str] = None
+    evidence: Optional[str] = None
     source: Literal["rule", "llm"] = "llm"
     related_check: Optional[str] = None
 
@@ -316,6 +334,14 @@ class LLMAnalysis(BaseModel):
     competitive_position: Optional[str] = None
 
 
+class Locale(BaseModel):
+    country: Optional[str] = None
+    country_source: Optional[Literal["tld", "content_language"]] = None
+    html_lang: Optional[str] = None
+    content_language: Optional[str] = None
+    privacy_law: Optional[str] = None
+
+
 class SiteReport(BaseModel):
     schema_version: str = SCHEMA_VERSION
     tool_version: str
@@ -329,6 +355,7 @@ class SiteReport(BaseModel):
     score: Score
     technical_seo: TechnicalSEO
     content_stats: ContentStats
+    locale: Locale = Field(default_factory=Locale)
     llm_analysis: LLMAnalysis
     quick_wins: list[QuickWin] = Field(default_factory=list)
     pages: list[PageRecord] = Field(default_factory=list)

@@ -97,7 +97,8 @@ def print_outcome(i: int, n: int, url: str, out: AnalysisOutcome) -> None:
     print(f"\n[{i}/{n}] {r['site']}" + ("  (cached report, use --force to re-run)" if out.from_cache else ""))
     print(f"  crawl : {c['status']}  ({c['pages_ok']} ok / {c['pages_blocked']} blocked / "
           f"{c['pages_failed']} failed, {c['duration_seconds']}s)" + (f"  reason: {c['reason']}" if c.get("reason") else ""))
-    print(f"  score : {score} ({s['label']}, coverage {int(s['coverage'] * 100)}%)")
+    conf = f", {s['confidence']} confidence ({s['pages_scored']} pages)" if s.get("confidence") else ""
+    print(f"  score : {score} ({s['label']}, coverage {int(s['coverage'] * 100)}%{conf})")
     tag = f" [{llm['error_type'].upper().replace('_', ' ')}]" if llm.get("error_type") else ""
     print(f"  llm   : {llm['status']}{tag}" + (f" ({llm['reason']})" if llm.get("reason") else f" ({llm.get('model')})"))
     print(f"  wins  : {len(r['quick_wins'])} quick wins ({high} high priority)")

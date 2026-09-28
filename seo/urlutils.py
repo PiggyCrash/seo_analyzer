@@ -23,18 +23,20 @@ EXCLUDE_PATH = re.compile(
     r"/tag/|/tags/|/category/|/categories/|/author/|/page/\d+|/search(/|$)|/calendar|/events/\d{4})",
     re.I)
 
-_BLOG = r"(blog|news|insights|articles|resources|journal|posts?|stories|learn)"
+_BLOG = r"(blog|news|insights|articles|resources|journal|posts?|stories|learn|read|berita|artikel|siaran-pers|press)"
+LOCALE_PREFIX = re.compile(r"^/[a-z]{2}(?:[-_][a-z]{2})?(?=/|$)", re.I)
 PAGE_PATTERNS: list[tuple[str, re.Pattern, float]] = [
-    ("blog_index", re.compile(rf"^/{_BLOG}/?$", re.I), 8),
+    ("blog_index", re.compile(rf"^/{_BLOG}(-[a-z0-9-]+)?/?$", re.I), 8),
     ("blog_post", re.compile(rf"^/{_BLOG}/.+", re.I), 4),
-    ("about", re.compile(r"(about|who-we-are|our-story|company|mission)", re.I), 10),
+    ("about", re.compile(r"(about|who-we-are|our-story|company|mission|tentang|profil|sejarah|visi-dan-misi)", re.I), 10),
     ("pricing", re.compile(r"(pricing|plans|packages)", re.I), 9),
-    ("service", re.compile(r"(services?|solutions?|what-we-do|products?|features?|offerings?|capabilit)", re.I), 9),
+    ("service", re.compile(r"(services?|solutions?|what-we-do|products?|features?|offerings?|capabilit|"
+                           r"produk|layanan)", re.I), 9),
     ("case_study", re.compile(r"(case-stud|portfolio|our-work|/work(/|$)|clients|results|success-stor)", re.I), 7),
-    ("contact", re.compile(r"(contact|get-in-touch|book-a-call|demo)", re.I), 8),
-    ("faq", re.compile(r"(faq|help|support)", re.I), 6),
-    ("team", re.compile(r"(team|people|careers|jobs)", re.I), 5),
-    ("legal", re.compile(r"(privacy|terms|cookie|legal|disclaimer|gdpr|pdpa|imprint)", re.I), 1),
+    ("contact", re.compile(r"(contact|get-in-touch|book-a-call|demo|hubungi|kontak)", re.I), 8),
+    ("faq", re.compile(r"(faq|help|support|bantuan)", re.I), 6),
+    ("team", re.compile(r"(team|people|careers|jobs|karir|karier)", re.I), 5),
+    ("legal", re.compile(r"(privacy|terms|cookie|legal|disclaimer|gdpr|pdpa|imprint|kebijakan-privasi|syarat)", re.I), 1),
 ]
 
 
@@ -139,8 +141,12 @@ def is_crawlable(url: str) -> bool:
 
 
 def classify_path(path: str) -> tuple[str, float]:
+    """Page type from the URL path. A leading locale segment (/id/, /en-GB/) is ignored."""
     if path in ("", "/"):
         return "home", 100.0
+    path = LOCALE_PREFIX.sub("", path) or "/"
+    if path == "/":
+        return "other", 2.0
     for name, rx, score in PAGE_PATTERNS:
         if rx.search(path):
             return name, score

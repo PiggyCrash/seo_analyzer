@@ -1,5 +1,7 @@
 crawl:
   max_pages: 15
+  max_fetch_attempts: 40
+  sitemap_probe: 10
   per_domain_concurrency: 2
   delay_seconds: 1.0
   request_timeout: 15
