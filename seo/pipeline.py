@@ -14,8 +14,8 @@ from pydantic import ValidationError
 from . import __version__
 from .config import ROOT_DIR, Settings
 from .crawler import Crawler, CrawlResult
-from .extractor import extract_page, rollup
-from .llm import LLMAnalyzer, LLMUnavailable, build_digest, classify_error
+from .extractor import boilerplate_text, build_findings, extract_page, rollup
+from .llm import MERGEABLE, LLMAnalyzer, LLMUnavailable, build_digest, classify_error, covered_topics
 from .schema import LLMAnalysis, PageRecord, SiteReport
 from .scoring import compute_score, rule_quick_wins, sort_wins
 from .storage import Storage
@@ -86,19 +86,24 @@ class SEOPipeline:
 
         tech, content, locale = rollup(records, summary)
         score = compute_score(tech, content.pages_analyzed)
-        rule_wins = rule_quick_wins(tech, content)
+        findings = build_findings(records, summary, tech)
+        rule_wins = rule_quick_wins(tech, content, findings)
         site = crawl.site_key
-        llm, llm_wins = await self._run_llm(site, summary, tech, content, locale, records, rule_wins, use_llm)
+        llm, llm_wins = await self._run_llm(site, summary, tech, content, locale, records, rule_wins, findings,
+                                            use_llm)
+        # An LLM win on a mergeable topic (e.g. schema with the real legal name/ticker) replaces the generic rule win.
+        replaced = {q.related_check for q in llm_wins if q.related_check in MERGEABLE}
+        rule_wins = [q for q in rule_wins if q.related_check not in replaced]
 
         return SiteReport(
             tool_version=__version__, site=site, company=llm.company, sector=llm.sector,
             input_url=crawl.input_url, analyzed_at=datetime.now(timezone.utc),
             analysis_seconds=round(time.monotonic() - t0, 2), crawl=summary, score=score,
-            technical_seo=tech, content_stats=content, locale=locale, llm_analysis=llm,
+            technical_seo=tech, content_stats=content, locale=locale, llm_analysis=llm, findings=findings,
             quick_wins=sort_wins(rule_wins + llm_wins),
             pages=records if self.settings.storage.include_pages else [])
 
-    async def _run_llm(self, site, summary, tech, content, locale, records, rule_wins, use_llm):
+    async def _run_llm(self, site, summary, tech, content, locale, records, rule_wins, findings, use_llm):
         cfg = self.settings.llm
         model = cfg.model
         if not use_llm or not cfg.enabled:
@@ -112,9 +117,11 @@ class SEOPipeline:
             reason = f"insufficient_data: homepage_ok={home_ok}, pages_ok={summary.pages_ok}, needed={needed}"
             return LLMAnalysis(status="skipped", reason=reason, model=model), []
 
-        digest = build_digest(site, summary, tech, content, locale, records, rule_wins, cfg.max_digest_chars)
+        digest = build_digest(site, summary, tech, content, locale, records, rule_wins, cfg.max_digest_chars,
+                              findings)
+        nav = frozenset(t.casefold() for t in boilerplate_text([r.facts for r in records if r.facts]))
         try:
-            out = await self._llm.analyze(digest, frozenset(q.related_check for q in rule_wins if q.related_check))
+            out = await self._llm.analyze(digest, covered_topics(rule_wins), nav)
         except LLMUnavailable as exc:
             return LLMAnalysis(status="failed", error_type=exc.error_type, reason=str(exc)[:400], model=model), []
         except Exception as exc:

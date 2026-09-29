@@ -62,9 +62,15 @@ The score is computed from weighted checks (`seo/scoring.py`) and is reproducibl
 
 Each report has a `locale` (country from the TLD, or from the detected content language, plus the matching privacy law, e.g. `.co.id` → UU PDP, `.sg` → PDPA, EU → GDPR). The cookie-banner finding and the LLM prompt both use it. The `lang` check compares `<html lang>` with the detected content language, and `broken_links` reports 404/410 URLs among the crawled pages plus a spread-out sample of sitemap URLs.
 
-Quick wins have `source: "rule"` (derived from the facts) or `source: "llm"` (strategy/content), plus `priority`, `effort` and `category`. The summary lists them ranked by priority and effort, with high-effort work under `larger_projects`. LLM keyword suggestions are tagged `llm_suggested` because they are hypotheses, not search-volume data.
+The crawler also requests a URL that cannot exist (at the root and under the main locale prefix, e.g. `/id/seo-probe-xxxx`). A 200 answer is reported as `soft_404`, and crawled pages that match that empty template are marked `empty_template` and left out of content stats. The sitemap check reports duplicate and malformed entries, and for dead URLs under a locale prefix (`/en-GB/`) it retries the same slug under the prefixes the site does serve (`/en/`), so a sitemap-generator bug is not reported as broken links.
 
-The LLM receives today's date, the country, the content language, the privacy law and the sample size. Its output is filtered afterwards: quick wins without `evidence` from the digest, wins that restate a rule-based win, and keywords or wins containing a past year are dropped.
+Word counts and LLM excerpts use page-specific text only: text repeated on at least half of the crawled pages (menus, footers) is removed, even on sites that do not use `<nav>`/`<footer>` tags. An empty `<h1></h1>` counts as no H1.
+
+`site_specific_findings` lists observations the generic checks cannot express, each with evidence: JavaScript-only counters that ship as "0 +", a name spelled differently in a heading and the menu, debug/version response headers, placeholder content, stale copyright years, headings used for layout or wrapping a phone number, empty meta tags, trackers missing on the homepage, no Google Analytics.
+
+Quick wins have `source: "rule"` (derived from the facts) or `source: "llm"` (strategy/content), plus `priority`, `effort` and `category` (kept in the full report). Rule wins name the exact URL, file, value or text involved (e.g. "Add alt text to logo_bio.png in the shared template (missing on 15 of 15 pages)"). The summary lists up to 12 quick wins as plain action strings, ranked by priority and effort, with at least 3 LLM wins when the LLM produced them. LLM keyword suggestions are tagged `llm_suggested` because they are hypotheses, not search-volume data.
+
+The LLM receives today's date, the country, the content language, the privacy law, the sample size, the findings and the non-social domains the homepage links to (`related_domains`). Its output is filtered afterwards: quick wins without `evidence`, wins that restate a rule-based win, keywords or wins containing a past year, navigation labels passed off as captured keywords, and keywords/wins for an intent a sister site of the same brand already serves (kimiafarma.co.id → kimiafarmaapotek.co.id owns "apotek") are dropped. An LLM schema win replaces the generic rule schema win, because the LLM can name the legal entity, ticker and parent company.
 
 ## When the API key runs out
 

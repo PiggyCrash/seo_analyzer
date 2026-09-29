@@ -6,7 +6,7 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "1.2"
 
 CheckStatus = Literal["present", "missing", "partial", "not_checked", "error"]
 
@@ -51,6 +51,7 @@ class TechnicalSEO(BaseModel):
     cookie_banner: Check
     platform: Check
     broken_links: Check
+    not_found_handling: Check = Field(default_factory=lambda: not_checked("not_probed"))
 
 
 class RobotsInfo(BaseModel):
@@ -75,6 +76,13 @@ class SitemapInfo(BaseModel):
     probe_checked: int = 0
     probe_dead: int = 0
     probe_dead_examples: list[str] = Field(default_factory=list)
+    unique_urls: Optional[int] = None
+    duplicate_entries: int = 0
+    malformed_entries: int = 0
+    malformed_examples: list[str] = Field(default_factory=list)
+    prefix_counts: dict[str, int] = Field(default_factory=dict)
+    prefix_fixes: dict[str, str] = Field(default_factory=dict)
+    prefix_fix_examples: list[str] = Field(default_factory=list)
 
 
 class BrokenURL(BaseModel):
@@ -88,6 +96,14 @@ class HttpsInfo(BaseModel):
     ssl_error: bool = False
     http_redirects_to_https: Optional[bool] = None
     hsts: bool = False
+
+
+class NotFoundProbe(BaseModel):
+    """A request for a URL that cannot exist. A healthy site answers 404/410."""
+    url: str
+    status_code: Optional[int] = None
+    title: Optional[str] = None
+    words: int = 0
 
 
 class BlockerCount(BaseModel):
@@ -116,6 +132,7 @@ class CrawlSummary(BaseModel):
     robots: RobotsInfo = Field(default_factory=RobotsInfo)
     sitemap: SitemapInfo = Field(default_factory=SitemapInfo)
     https: Optional[HttpsInfo] = None
+    not_found_probes: list[NotFoundProbe] = Field(default_factory=list)
     duration_seconds: float = 0.0
     user_agent: str = ""
 
@@ -155,14 +172,22 @@ class PageFacts(BaseModel):
     twitter: dict[str, str] = Field(default_factory=dict)
     h1: list[str] = Field(default_factory=list)
     h1_count: int = 0
+    h1_empty: int = 0
+    top_heading: Optional[str] = None
+    minor_headings: list[str] = Field(default_factory=list)
     h2: list[str] = Field(default_factory=list)
     h3_count: int = 0
     heading_skips: int = 0
     word_count: int = 0
+    word_count_raw: int = 0
+    empty_template: bool = False
     images_total: int = 0
     images_missing_alt: int = 0
     images_empty_alt: int = 0
+    missing_alt_srcs: list[str] = Field(default_factory=list)
     internal_links: int = 0
+    link_locale_prefixes: list[str] = Field(default_factory=list)
+    external_domains: list[str] = Field(default_factory=list)
     external_links: int = 0
     nofollow_links: int = 0
     schema_types: list[str] = Field(default_factory=list)
@@ -172,7 +197,9 @@ class PageFacts(BaseModel):
     consent_vendor: Optional[str] = None
     platform: Optional[str] = None
     generator: Optional[str] = None
+    signals: dict[str, Any] = Field(default_factory=dict)
     text_excerpt: str = ""
+    text_nodes: list[str] = Field(default_factory=list, exclude=True)
 
 
 class PageRecord(BaseModel):
@@ -182,6 +209,7 @@ class PageRecord(BaseModel):
 
 class ContentStats(BaseModel):
     pages_analyzed: int = 0
+    empty_template_pages: int = 0
     avg_word_count: int = 0
     thin_pages: int = 0
     page_types: dict[str, int] = Field(default_factory=dict)
@@ -334,6 +362,15 @@ class LLMAnalysis(BaseModel):
     competitive_position: Optional[str] = None
 
 
+class Finding(BaseModel):
+    """A site-specific observation (template defect, leaked debug header, JS-only content...)."""
+    type: str
+    severity: Literal["high", "medium", "low"] = "medium"
+    message: str
+    evidence: Optional[str] = None
+    pages: int = 0
+
+
 class Locale(BaseModel):
     country: Optional[str] = None
     country_source: Optional[Literal["tld", "content_language"]] = None
@@ -357,5 +394,6 @@ class SiteReport(BaseModel):
     content_stats: ContentStats
     locale: Locale = Field(default_factory=Locale)
     llm_analysis: LLMAnalysis
+    findings: list[Finding] = Field(default_factory=list)
     quick_wins: list[QuickWin] = Field(default_factory=list)
     pages: list[PageRecord] = Field(default_factory=list)

@@ -13,7 +13,7 @@ from typing import Optional
 from pydantic import ValidationError
 
 from .config import LLMConfig
-from .schema import ContentStats, CrawlSummary, LLMOutput, Locale, PageRecord, QuickWin, TechnicalSEO
+from .schema import ContentStats, CrawlSummary, Finding, LLMOutput, Locale, PageRecord, QuickWin, TechnicalSEO
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +80,15 @@ Rules:
 - Respect what the facts say does NOT exist. If `content_stats.blog_detected` is false, do not treat the site as having blog posts; "create a blog/news section" is a separate, high-effort project.
 - Every quick win MUST include `evidence`: the specific URL, title, heading, excerpt phrase or measured value in the digest that motivates it. The evidence must actually support the action (e.g. do not recommend translating text that is already in the audience's language). Quick wins without concrete evidence are discarded.
 - Do not propose features the site gives no sign of offering (live chat, appointment booking, e-commerce, etc.). Suggestions must fit what this organisation actually does, as shown in the digest.
+- First decide the site's ROLE from the digest (e.g. corporate / investor-relations hub, online store, local service business, SaaS, media). Keywords and wins must fit that role. `context.related_domains` lists the non-social domains the homepage links to (often subsidiaries, shops, portals). When a related domain clearly serves an intent (a pharmacy/shop domain = retail and product queries, a lab domain = lab services, a careers/e-procurement portal = those queries), do NOT suggest keywords, pages or wins for that intent on this site; name the domain in keyword_strategy instead.
+- Prefer wins that improve pages that already exist. Creating a new page or section is effort "high" and only valid when the digest shows the topic is not served anywhere.
+- `findings` and `technical_checks` list defects already measured (soft-404s, sitemap prefix bugs, placeholder content, leaked headers, JS-only counters...). Use them to explain impact in summary/content_assessment, but do not turn them into quick wins again.
+- captured_keywords must be search phrases a user would type, evidenced by titles, headings or copy. Never list bare navigation labels ("Profil", "Contact Center", "Home").
+- Pages with `empty_template: true` are empty CMS shells: never count their text as content.
+- Use concrete facts from the excerpts (founding year, figures, product lines, subsidiaries, licences, locations, stock ticker) in content_assessment and in entity/schema suggestions.
+- competitive_position: name 2-4 real, well-known competitors in this country and niche, and say which queries are realistically winnable. You have no ranking data: phrase it as an assessment, not a measurement.
+- If a heading or title in the digest contains an obvious misspelling, you may add a quick win to fix it, quoting the exact text as evidence.
+- Quick wins must name the exact page, element, text or entity involved (e.g. "Add Organization JSON-LD with tickerSymbol X and parentOrganization Y"), not a generic category.
 - effort: low = under a day of work, medium = a few days, high = weeks or a new site section. Rank honestly.
 - Be specific to THIS site and its niche. No generic filler.
 - Output ONLY one JSON object. No markdown, no code fences, no commentary.
@@ -113,30 +122,97 @@ RULE_TOPICS = {
     "canonical": re.compile(r"canonical", re.I),
     "open_graph": re.compile(r"open graph|og:", re.I),
     "broken_links": re.compile(r"dead (urls?|links?)|broken links?|\b404\b", re.I),
+    "not_found_handling": re.compile(r"\b404\b|soft.?404|unknown urls?|empty (template|shell)", re.I),
+    "sitemap": re.compile(r"sitemap", re.I),
+    "hreflang": re.compile(r"hreflang", re.I),
+    "heading_hierarchy": re.compile(r"\bh[1-6]\b.*(hierarch|outline|level)|heading (levels?|hierarchy)", re.I),
+    "zero_counters": re.compile(r"counters?|statistics? (render|show)", re.I),
+    "name_mismatch": re.compile(r"spelling|misspell", re.I),
+    "leaky_headers": re.compile(r"(debug|response) header", re.I),
+    "legacy_scripts": re.compile(r"html5shiv|respond\.js|maxcdn|polyfill", re.I),
+    "no_google_analytics": re.compile(r"google analytics|\bga4\b|tag manager", re.I),
+    "placeholder_content": re.compile(r"placeholder", re.I),
+    "stale_copyright": re.compile(r"copyright", re.I),
+    "thin_content": re.compile(r"thin (pages?|content)|expand .{0,40}pages?|\b\d{3,4}\+? words\b", re.I),
 }
 
 
-def clean_output(out: LLMOutput, today: date, rule_checks: frozenset[str] = frozenset()) -> LLMOutput:
+def covered_topics(rule_wins: list[QuickWin]) -> frozenset[str]:
+    """Topics the rule-based wins already cover: their own check plus any topic their text mentions
+    (e.g. the lang win also asks for hreflang)."""
+    topics = {q.related_check for q in rule_wins if q.related_check}
+    topics |= {t for t, rx in RULE_TOPICS.items() for q in rule_wins if q.source == "rule" and rx.search(q.action)}
+    return frozenset(topics)
+
+
+SOCIAL_DOMAINS = frozenset({"facebook.com", "twitter.com", "x.com", "instagram.com", "linkedin.com", "youtube.com",
+                            "tiktok.com", "wa.me", "api.whatsapp.com", "t.me", "pinterest.com", "google.com",
+                            "maps.google.com", "goo.gl", "bit.ly"})
+
+
+# Rule wins the LLM may REPLACE with a more specific version (it knows the entity: legal name, ticker, parent...).
+MERGEABLE = frozenset({"schema_markup"})
+_DASHES = re.compile(r"[‐-―−]")
+
+
+def served_elsewhere(site: str, related_domains: list[str]) -> frozenset[str]:
+    """Intent tokens owned by sister sites that share the brand: kimiafarma.co.id links to
+    kimiafarmaapotek.co.id -> 'apotek', labkimiafarma.co.id -> 'lab', eproc.kimiafarma.co.id -> 'eproc'."""
+    brand = site.split(".")[0].lower()
+    tokens = set()
+    for d in related_domains:
+        labels = d.lower().split(".")
+        if d.lower().endswith("." + site.lower()):
+            rest = labels[0]
+        elif brand in labels[0] and labels[0] != brand:
+            rest = labels[0].replace(brand, "")
+        else:
+            continue
+        rest = re.sub(r"[^a-z]", "", rest)
+        if len(rest) >= 3:
+            tokens.add(rest)
+    return frozenset(tokens)
+
+
+def _mentions(text: str, tokens: frozenset[str]) -> bool:
+    words = re.findall(r"[^\W\d_]+", (text or "").lower().replace("-", ""))
+    return any(w.startswith(t) for w in words for t in tokens)
+
+
+def clean_output(out: LLMOutput, today: date, rule_checks: frozenset[str] = frozenset(),
+                 nav_labels: frozenset[str] = frozenset(), elsewhere: frozenset[str] = frozenset()) -> LLMOutput:
     """Drop what the prompt forbids but models still produce: evidence-free wins, stale-year keywords,
-    and wins that restate a rule-based quick win."""
+    wins that restate a rule-based quick win, navigation labels passed off as keywords, and keywords/wins
+    for an intent a sister site of the same brand already serves."""
     def stale(text: str) -> bool:
         return any(int(m.group(0)) < today.year for m in _YEAR.finditer(text or ""))
 
-    def repeats_rule(action: str) -> bool:
-        return any(RULE_TOPICS[c].search(action) for c in rule_checks if c in RULE_TOPICS)
+    def topic(action: str) -> Optional[str]:
+        text = _DASHES.sub("-", action)
+        return next((c for c in rule_checks if c in RULE_TOPICS and RULE_TOPICS[c].search(text)), None)
 
-    wins = [q for q in out.quick_wins
-            if (q.evidence or "").strip() and not stale(q.action) and not repeats_rule(q.action)]
-    kws = [k for k in out.missed_keywords if not stale(k.keyword)]
-    dropped = len(out.quick_wins) - len(wins), len(out.missed_keywords) - len(kws)
+    wins = []
+    for q in out.quick_wins:
+        q = q.model_copy(update={"action": _DASHES.sub("-", q.action)})
+        t = topic(q.action)
+        if not (q.evidence or "").strip() or stale(q.action) or (t and t not in MERGEABLE) \
+                or _mentions(q.action, elsewhere):
+            continue
+        wins.append(q.model_copy(update={"related_check": t}) if t else q)
+    kws = [k for k in out.missed_keywords if not stale(k.keyword) and not _mentions(k.keyword, elsewhere)]
+    captured = [k for k in out.captured_keywords
+                if k.casefold() not in nav_labels and not k.isupper()]
+    dropped = len(out.quick_wins) - len(wins), len(out.missed_keywords) - len(kws), \
+        len(out.captured_keywords) - len(captured)
     if any(dropped):
-        log.info("dropped %d LLM quick win(s) (no evidence, stale year or repeats a rule), %d stale keyword(s)",
-                 *dropped)
-    return out.model_copy(update={"quick_wins": wins, "missed_keywords": kws})
+        log.info("dropped %d LLM quick win(s) (no evidence, stale year or repeats a rule), %d stale keyword(s), "
+                 "%d navigation label(s)", *dropped)
+    return out.model_copy(update={"quick_wins": wins, "missed_keywords": kws, "captured_keywords": captured})
 
 
 def build_digest(site: str, crawl: CrawlSummary, tech: TechnicalSEO, content: ContentStats, locale: Locale,
-                 records: list[PageRecord], rule_wins: list[QuickWin], max_chars: int) -> dict:
+                 records: list[PageRecord], rule_wins: list[QuickWin], max_chars: int,
+                 findings: list[Finding] = ()) -> dict:
     checks = {}
     for name, c in tech:
         entry = {"status": c.status}
@@ -149,15 +225,27 @@ def build_digest(site: str, crawl: CrawlSummary, tech: TechnicalSEO, content: Co
             entry["details"] = slim
         checks[name] = entry
 
+    home = records[0].facts if records and records[0].facts else None
+    related = [d for d in (home.external_domains if home else []) if d not in SOCIAL_DOMAINS][:12]
+
     pages, excerpts = [], []
     for r in records:
         f = r.facts
         if not f:
             continue
-        pages.append({"url": f.url, "type": f.page_type, "lang": f.lang, "content_language": f.content_language,
-                      "title": f.title, "meta_description": f.meta_description,
-                      "h1": f.h1[:2], "h2": f.h2[:8], "word_count": f.word_count,
-                      "internal_links": f.internal_links, "schema_types": f.schema_types})
+        if f.empty_template:
+            pages.append({"url": f.url, "empty_template": True, "title": f.title})
+            excerpts.append(None)
+            continue
+        entry = {"url": f.url, "type": f.page_type, "lang": f.lang, "content_language": f.content_language,
+                 "title": f.title, "meta_description": f.meta_description,
+                 "h1": f.h1[:2], "h2": f.h2[:8], "word_count": f.word_count,
+                 "internal_links": f.internal_links, "schema_types": f.schema_types}
+        if f.page_type == "home":
+            entry["top_heading"] = f.top_heading
+            entry["minor_headings"] = f.minor_headings[:25]
+            entry["external_domains_linked"] = f.external_domains
+        pages.append(entry)
         excerpts.append(f.text_excerpt)
 
     digest = {
@@ -168,10 +256,12 @@ def build_digest(site: str, crawl: CrawlSummary, tech: TechnicalSEO, content: Co
             "html_lang": locale.html_lang, "privacy_law": locale.privacy_law,
             "sample": {"pages_analyzed": content.pages_analyzed, "sitemap_urls": crawl.sitemap.url_count,
                        "broken_urls_found": len(crawl.broken_urls)},
+            "related_domains": related,
         },
         "crawl": {"status": crawl.status, "pages_ok": crawl.pages_ok, "flags": crawl.flags,
                   "blockers": [b.model_dump() for b in crawl.blockers]},
         "technical_checks": checks,
+        "findings": [f.message for f in findings],
         "content_stats": content.model_dump(),
         "rule_based_quick_wins": [q.action for q in rule_wins],
         "pages": pages,
@@ -180,13 +270,15 @@ def build_digest(site: str, crawl: CrawlSummary, tech: TechnicalSEO, content: Co
     length = 1200
     while True:
         for p, ex in zip(pages, excerpts):
-            p["excerpt"] = ex[:length]
+            if ex is not None:
+                p["excerpt"] = ex[:length]
         if len(json.dumps(digest, ensure_ascii=False)) <= max_chars or length <= 120:
             break
         length = int(length * 0.6)
     if len(json.dumps(digest, ensure_ascii=False)) > max_chars:
         for p in pages:
-            p["h2"] = p["h2"][:3]
+            if "h2" in p:
+                p["h2"] = p["h2"][:3]
     while len(json.dumps(digest, ensure_ascii=False)) > max_chars and len(pages) > 3:
         pages.pop()
     return digest
@@ -279,17 +371,19 @@ class LLMAnalyzer:
                 raise
         return resp.choices[0].message.content or ""
 
-    async def analyze(self, digest: dict, rule_checks: frozenset[str] = frozenset()) -> LLMOutput:
+    async def analyze(self, digest: dict, rule_checks: frozenset[str] = frozenset(),
+                      nav_labels: frozenset[str] = frozenset()) -> LLMOutput:
         messages = [{"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": json.dumps(digest, ensure_ascii=False)}]
         raw = await self._chat(messages)
         today = date.fromisoformat(digest["context"]["analysis_date"])
+        elsewhere = served_elsewhere(digest["site"], digest["context"].get("related_domains") or [])
         try:
-            return clean_output(LLMOutput.model_validate(_extract_json(raw)), today, rule_checks)
+            return clean_output(LLMOutput.model_validate(_extract_json(raw)), today, rule_checks, nav_labels, elsewhere)
         except (ValueError, ValidationError) as exc:
             log.warning("invalid LLM JSON, asking for a correction: %s", str(exc)[:200])
             messages += [{"role": "assistant", "content": raw},
                          {"role": "user", "content": f"That response was invalid: {str(exc)[:800]}\n"
                                                      "Return ONLY the corrected JSON object."}]
             raw = await self._chat(messages)
-            return clean_output(LLMOutput.model_validate(_extract_json(raw)), today, rule_checks)
+            return clean_output(LLMOutput.model_validate(_extract_json(raw)), today, rule_checks, nav_labels, elsewhere)

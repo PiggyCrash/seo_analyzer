@@ -5,6 +5,7 @@ import asyncio
 import gzip
 import logging
 import re
+import secrets
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -17,9 +18,10 @@ from bs4 import BeautifulSoup
 
 from .blockers import detect_blocker, has_hard_block_signal, page_flags
 from .config import CrawlConfig
-from .schema import BlockerCount, BrokenURL, CrawlSummary, HttpsInfo, PageFetch, RobotsInfo, SitemapInfo
-from .urlutils import (bare_host, classify_path, in_scope, is_crawlable, normalize_input,
-                       normalize_url, origin_candidates, origin_of, site_key)
+from .schema import (BlockerCount, BrokenURL, CrawlSummary, HttpsInfo, NotFoundProbe, PageFetch, RobotsInfo,
+                     SitemapInfo)
+from .urlutils import (bare_host, classify_path, in_scope, is_crawlable, locale_prefix, normalize_input,
+                       normalize_url, origin_candidates, origin_of, site_key, swap_locale_prefix)
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +91,7 @@ class CrawlResult:
     robots: RobotsInfo = field(default_factory=RobotsInfo)
     sitemap: SitemapInfo = field(default_factory=SitemapInfo)
     https: Optional[HttpsInfo] = None
+    not_found_probes: list = field(default_factory=list)
     budget_exceeded: Optional[str] = None
     stopped_early: Optional[str] = None
     duration_seconds: float = 0.0
@@ -135,6 +138,7 @@ class CrawlResult:
                                      for p in self.pages),
             flags=flags, budget_exceeded=self.budget_exceeded, stopped_early=self.stopped_early,
             robots=self.robots, sitemap=self.sitemap, https=self.https,
+            not_found_probes=self.not_found_probes,
             duration_seconds=self.duration_seconds, user_agent=self.user_agent)
 
     def to_cache(self) -> dict:
@@ -143,6 +147,7 @@ class CrawlResult:
                 "final_domain": self.final_domain, "status": self.status, "reason": self.reason,
                 "robots": self.robots.model_dump(), "sitemap": self.sitemap.model_dump(),
                 "https": self.https.model_dump() if self.https else None,
+                "not_found_probes": [p.model_dump() for p in self.not_found_probes],
                 "budget_exceeded": self.budget_exceeded, "stopped_early": self.stopped_early,
                 "duration_seconds": self.duration_seconds,
                 "pages": [p.to_cache() for p in self.pages]}
@@ -155,6 +160,7 @@ class CrawlResult:
                 robots=RobotsInfo(**(d.get("robots") or {})),
                 sitemap=SitemapInfo(**(d.get("sitemap") or {})),
                 https=HttpsInfo(**d["https"]) if d.get("https") else None,
+                not_found_probes=[NotFoundProbe(**p) for p in d.get("not_found_probes") or []],
                 budget_exceeded=d.get("budget_exceeded"), stopped_early=d.get("stopped_early"),
                 duration_seconds=d.get("duration_seconds", 0.0))
         r.pages = [FetchResult.from_cache(p, t) for p, t in zip(d.get("pages", []), texts)]
@@ -304,12 +310,44 @@ def select_pages(home: FetchResult, sitemap_urls: list[str], base_host: str,
 
 
 def probe_sample(urls: list[str], exclude: set[str], n: int) -> list[str]:
-    """Up to n URLs spread evenly across the sitemap, skipping ones already fetched."""
+    """Up to n URLs spread evenly across the sitemap, skipping ones already fetched.
+
+    Every large locale prefix (/id/, /en-GB/...) gets a slot first, so a dead prefix is not missed."""
     pool = [u for u in dict.fromkeys(urls) if u not in exclude]
     if n <= 0 or not pool:
         return []
-    step = max(1, len(pool) // n)
-    return pool[::step][:n]
+    groups: dict[Optional[str], list[str]] = {}
+    for u in pool:
+        groups.setdefault(locale_prefix(u), []).append(u)
+    picked = [g[len(g) // 2] for k, g in sorted(groups.items(), key=lambda kv: -len(kv[1]))
+              if k is not None and len(g) >= 5][:max(1, n // 2)]
+    rest = [u for u in pool if u not in picked]
+    step = max(1, len(rest) // max(1, n - len(picked)))
+    return (picked + rest[::step])[:n]
+
+
+def _home_link_prefixes(home: FetchResult) -> list[str]:
+    """Locale prefixes of the homepage's same-site links (one entry per link, www and non-www alike)."""
+    host = bare_host(urlparse(home.final_url or home.url).hostname)
+    out = []
+    for a in home.soup.find_all("a", href=True) if home.soup else []:
+        u = normalize_url(a["href"], base=home.final_url)
+        if u and bare_host(urlparse(u).hostname) == host and locale_prefix(u):
+            out.append(locale_prefix(u))
+    return out
+
+
+def sitemap_hygiene(raw_locs: list[str]) -> dict:
+    """Duplicates, malformed entries and locale-prefix distribution of the raw <loc> values."""
+    malformed = []
+    for u in raw_locs:
+        p = urlparse(u)
+        if not p.scheme or not p.hostname or "//" in p.path or re.search(r"https?:", p.path) or " " in u:
+            malformed.append(u)
+    prefixes = Counter(locale_prefix(u) or "(none)" for u in raw_locs)
+    return {"unique_urls": len(set(raw_locs)), "duplicate_entries": len(raw_locs) - len(set(raw_locs)),
+            "malformed_entries": len(malformed), "malformed_examples": list(dict.fromkeys(malformed))[:5],
+            "prefix_counts": dict(prefixes.most_common(8))}
 
 
 class _SiteSession:
@@ -516,7 +554,7 @@ class _SiteSession:
             blog = sum(classify_path(urlparse(u).path)[0] == "blog_post" for u in urls)
             return SitemapInfo(status="present", url=url, url_count=len(urls), blog_url_count=blog,
                                is_index=is_index, child_sitemaps=children,
-                               declared_in_robots=bool(declared)), urls[:2000]
+                               declared_in_robots=bool(declared), **sitemap_hygiene(urls)), urls[:2000]
         return SitemapInfo(status="invalid" if invalid_url else "missing", url=invalid_url,
                            declared_in_robots=bool(declared)), []
 
@@ -616,6 +654,7 @@ class _SiteSession:
         result.final_domain = bare_host(base_host)
 
         result.https = await self._https_info(home, https_ssl_error)
+        result.not_found_probes = await self._probe_not_found(final_origin, home)
         result.sitemap, sitemap_urls = await self._discover_sitemap(final_origin, result.robots.sitemaps)
 
         candidates = select_pages(home, sitemap_urls, base_host, self.cfg)
@@ -624,6 +663,59 @@ class _SiteSession:
         if not result.stopped_early:
             await self._probe_sitemap(sitemap_urls, result, base_host, t0)
         return result.finalize(t0)
+
+    async def _probe_not_found(self, origin: str, home: FetchResult) -> list[NotFoundProbe]:
+        """Request URLs that cannot exist (at the root and under the main locale prefix).
+        A 200 answer means the CMS serves soft-404s: every junk URL becomes an indexable empty page."""
+        prefixes: Counter = Counter()
+        for lp in _home_link_prefixes(home):
+            prefixes[lp] += 1
+        token = "seo-probe-" + secrets.token_hex(4)
+        paths = [f"/{token}"] + ([f"/{prefixes.most_common(1)[0][0]}/{token}"] if prefixes else [])
+        out = []
+        for path in paths:
+            url = origin + path
+            if not self._allowed(url):
+                continue
+            r = await self.fetch(url, kind="raw")
+            if r.outcome == "blocked" or r.status_code is None:
+                continue
+            soup = BeautifulSoup(r.text or "", "lxml")
+            title = soup.title.get_text(" ", strip=True) if soup.title else None
+            out.append(NotFoundProbe(url=url, status_code=r.status_code, title=title, words=_visible_words(soup)))
+        return out
+
+    async def _diagnose_prefixes(self, result: CrawlResult, t0: float) -> None:
+        """Dead sitemap URLs under a locale prefix the site does not serve (/en-GB/ vs /en/): retry the
+        same slug under each prefix that does work, and record the prefix that fixes it."""
+        sm = result.sitemap
+        dead = sm.probe_dead_examples + [p.url for p in result.pages
+                                         if p.outcome == "failed" and p.status_code in DEAD_CODES]
+        live = Counter(locale_prefix(p.final_url or p.url) for p in result.pages if p.outcome == "ok")
+        live.pop(None, None)
+        if result.pages:
+            # Language versions linked from the homepage (e.g. the /en/ switcher) are candidates too.
+            for lp in set(_home_link_prefixes(result.pages[0])):
+                live.setdefault(lp, 0)
+        by_prefix: dict[str, list[str]] = {}
+        for u in dict.fromkeys(dead):
+            lp = locale_prefix(u)
+            if lp and lp not in live:
+                by_prefix.setdefault(lp, []).append(u)
+        for dead_prefix, urls in by_prefix.items():
+            base = re.split(r"[-_]", dead_prefix)[0].lower()
+            for cand in sorted(live, key=lambda x: (x.lower() != base, -live[x]))[:3]:
+                if time.monotonic() - t0 > self.cfg.site_time_budget:
+                    return
+                alt = swap_locale_prefix(urls[0], cand)
+                if not self._allowed(alt):
+                    continue
+                r = await self.fetch(alt, kind="raw")
+                if r.status_code == 200:
+                    sm.prefix_fixes[dead_prefix] = cand
+                    if len(sm.prefix_fix_examples) < 3:
+                        sm.prefix_fix_examples.append(f"{urls[0]} -> {alt}")
+                    break
 
     async def _probe_sitemap(self, sitemap_urls: list[str], result: CrawlResult, base_host: str,
                              t0: float) -> None:
@@ -643,6 +735,7 @@ class _SiteSession:
                 sm.probe_dead += 1
                 if len(sm.probe_dead_examples) < 5:
                     sm.probe_dead_examples.append(url)
+        await self._diagnose_prefixes(result, t0)
 
 
 class Crawler:

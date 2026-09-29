@@ -1,5 +1,45 @@
 # History
 
+## 2026-09-28: Site-specific depth (comparison with a coworker's reports)
+
+### Requirements
+
+- Bring the Kimia Farma report to the quality of the coworker's reports (1solar.sg, 1achieve.net, 0penny.com): site-specific insight, measured data that holds up against a manual crawl, depth, no internal contradictions
+- Remove `larger_projects` from the summary; quick wins as plain action strings, like the coworker's JSON
+
+### Problems found and solutions applied
+
+| Problem | Cause | Solution |
+|---|---|---|
+| "1 page without H1" when 5 had none | Empty `<h1></h1>` counted as an H1 | Missing = no non-empty H1; `empty_tag` count and examples; homepage top heading reported |
+| "Content is rich (avg 570 words)" | Word count taken before menus were removed, and this site has no `<nav>` tags; the mega-menu renders twice | Text repeated on ≥50% of pages is removed before word counts and excerpts |
+| 4 of 15 pages were empty CMS shells, analyzed as content | No soft-404 detection (`/id/anything` returns 200) | Crawler probes a nonexistent URL; `not_found_handling` check (weight 6); `empty_template` pages excluded from content stats |
+| "Fix broken links (10 URLs 404)" | Dead sitemap URLs reported as broken links | Sitemap prefix diagnosis: 193 entries use `/en-GB/` `/id-ID/`, the same slugs work under `/en/` `/id/`; plus duplicate and malformed entries |
+| og tags "Present" | Only checked that tags exist | Flags og:url pointing to the homepage on inner pages, constant og:title, og:site_name holding a URL |
+| "15 of 84 images missing alt" | Counted per image | Detects one image missing on most pages (logo_bio.png, a shared-template fix) |
+| Platform "Not detected" | HTML markers only | Session cookies (ci_session → CodeIgniter, laravel_session, PHPSESSID...) |
+| Analytics "Meta Pixel" | No per-page coverage | Reports inner-pages-only trackers and missing GA4/GTM |
+| No hreflang finding | hreflang "not scored" | Detects `/id/` + `/en/` trees without hreflang, merged into the lang quick win |
+| No site-specific insight | Nothing looked for anomalies | `site_specific_findings`: "0 +" JS counters, heading vs. menu spelling (MARIN LISA vs Marin Liza), `X-Debug-HTACCESS` header, placeholder content, stale copyright, phone number in an H6, 27 H5/H6 layout labels, empty `google-site-verification` / `fb:app_id` |
+| Generic quick wins | Rule wins stated counts only | Each rule win names the URL, value or file; findings become wins |
+| Captured keywords were menu labels | LLM excerpts started with the menu | Boilerplate-free excerpts; nav labels and ALL-CAPS labels dropped |
+| Retail keywords on a corporate site | LLM ignored the subsidiary domains | `related_domains` in the digest; keywords/wins for sister-site intents (apotek, lab, eproc) dropped |
+| LLM wins repeated rule wins | Filter only matched each rule's own check; a non-breaking hyphen ("JSON‑LD") slipped past | Filter matches every topic a rule win mentions; unicode dashes normalized |
+| `larger_projects` | Separate list | Removed; `quick_wins` is a list of up to 12 action strings |
+
+### Kimia Farma result
+
+| | Before | After |
+|---|---|---|
+| Score | 66 Fair | 59 Fair (soft-404 now scored) |
+| Soft-404 | Not checked | CRITICAL: `/id/<anything>` returns 200 |
+| Sitemap | "Present (267 URLs)" | 263 entries, 217 unique; 193 on wrong locale prefixes; 18 malformed; 46 duplicates |
+| H1 | 1 page without | 6 without, 4 of them empty `<h1>` |
+| Avg words | 570 | 290 of page-specific text, on 11 real pages |
+| Site-specific findings | 0 | 8 |
+
+Schema version 1.2, tool version 1.2.0. Old reports still load in the summary.
+
 ## 2026-09-28: Interpretation-layer fixes (Kimia Farma review)
 
 ### Requirements

@@ -151,3 +151,16 @@ def classify_path(path: str) -> tuple[str, float]:
         if rx.search(path):
             return name, score
     return "other", 3.0
+
+
+def locale_prefix(url_or_path: str) -> Optional[str]:
+    """'/en-GB/read/x' -> 'en-GB'. None when the path does not start with a locale-like segment."""
+    path = urlparse(url_or_path).path if "://" in url_or_path else url_or_path
+    m = LOCALE_PREFIX.match(path or "")
+    return m.group(0).lstrip("/") if m else None
+
+
+def swap_locale_prefix(url: str, new_prefix: str) -> str:
+    p = urlparse(url)
+    path = LOCALE_PREFIX.sub("/" + new_prefix, p.path, count=1)
+    return urlunparse((p.scheme, p.netloc, path, "", p.query, ""))

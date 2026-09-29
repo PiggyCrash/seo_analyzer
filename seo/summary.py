@@ -2,19 +2,16 @@
 
 The full SiteReport (every check, crawl detail and page) stays in output/history/.
 This module turns it into a short summary: one sentence per check, keyword lists
-as plain strings, and quick wins ranked by priority/effort (large projects listed separately).
+as plain strings, site-specific findings, and quick wins as plain action strings ranked by priority/effort.
 """
 from __future__ import annotations
 
 from typing import Any, Optional
+from urllib.parse import urlparse
+
+from .extractor import TRACKER_NAMES
 
 NOT_VERIFIED = "Not verified"
-TRACKER_NAMES = {
-    "ga4": "Google Analytics 4", "universal_analytics": "Universal Analytics", "gtm": "GTM",
-    "meta_pixel": "Meta Pixel", "tiktok_pixel": "TikTok Pixel", "linkedin_insight": "LinkedIn Insight",
-    "hotjar": "Hotjar", "microsoft_clarity": "Microsoft Clarity", "plausible": "Plausible",
-    "google_ads": "Google Ads", "x_pixel": "X Pixel",
-}
 
 
 def _plural(n: int, word: str) -> str:
@@ -29,6 +26,10 @@ def _not_verified(c: dict) -> Optional[str]:
     return None
 
 
+def _path(url: Optional[str]) -> str:
+    return (urlparse(url).path or "/") if url else ""
+
+
 def _text(c: dict, label: str) -> str:
     d, n = c["details"], c.get("pages_checked") or 0
     if c["status"] == "missing":
@@ -37,31 +38,56 @@ def _text(c: dict, label: str) -> str:
     issues = [f"{d[k]} {k.replace('_', ' ')}" for k in ("missing", "too_long", "too_short", "duplicates") if d.get(k)]
     if not issues:
         return f"{home}; all {_plural(n, 'page')} OK"
-    return f"{home}; issues across {n} pages: {', '.join(issues)} (recommended {d['recommended_length']} chars)"
+    text = f"{home}; issues across {n} pages: {', '.join(issues)} (recommended {d['recommended_length']} chars)"
+    groups = d.get("duplicate_groups") or []
+    if groups:
+        text += ". Most reused: " + "; ".join(f"'{g['value'][:70]}' on {g['pages']} pages" for g in groups[:2])
+    if d.get("placeholder"):
+        vals = ", ".join(f"'{v}'" for v in d.get("placeholder_values") or [])
+        what = "bare title" if label == "title" else "placeholder description"
+        text += f". {d['placeholder']} page(s) have the {what} {vals}"
+    return text
 
 
 def _og(c: dict) -> str:
     if c["status"] == "missing":
         return "MISSING (no og:title / og:description) — social shares fall back to defaults"
     tags = ", ".join(c.get("value") or [])
+    d = c["details"]
     if c["status"] == "partial":
-        extra = [] if c["details"].get("homepage_og_image") else ["no og:image on homepage"]
+        extra = [] if d.get("homepage_og_image") else ["no og:image on homepage"]
+        if d.get("og_url_not_self"):
+            extra.append(f"og:url is '{d.get('og_url_value')}' on {d['og_url_not_self']} inner pages, so shares "
+                         "link to the homepage")
+        if d.get("constant_og_title"):
+            extra.append(f"og:title is the constant '{d['constant_og_title']}' on every page")
+        if d.get("og_site_name_is_url"):
+            extra.append(f"og:site_name is a URL ('{d['og_site_name_is_url']}')")
         if not tags:
             return "Partial — " + "; ".join(["no og tags on homepage"] + extra[1:] + (
                 [f"incomplete on {_plural(c['pages_affected'], 'page')}"] if c.get("pages_affected") else []))
-        if c.get("pages_affected"):
-            extra.append(f"incomplete on {_plural(c['pages_affected'], 'page')}")
+        if d.get("examples_missing"):
+            extra.append(f"missing on {_plural(len(d['examples_missing']), 'page')}")
         return f"Partial ({tags}) — " + "; ".join(extra)
     return f"Present ({tags})"
 
 
 def _h1(c: dict) -> str:
     d, h1 = c["details"], c.get("value") or []
-    home = f"Homepage H1: '{h1[0]}'" if len(h1) == 1 else (
-        f"Homepage has {len(h1)} H1s" if h1 else "No H1 on homepage")
+    if len(h1) == 1:
+        home = f"Homepage H1: '{h1[0]}'"
+    elif h1:
+        home = f"Homepage has {len(h1)} H1s"
+    else:
+        top = d.get("homepage_top_heading")
+        home = "No H1 on homepage" + (f" (top heading is {top.split(':', 1)[0]} '{top.split(': ', 1)[-1][:60]}')"
+                                      if top else "")
     issues = []
     if d.get("missing"):
-        issues.append(f"{d['missing']} page(s) without H1")
+        issues.append(f"{d['missing']} page(s) without a usable H1")
+    if d.get("empty_tag"):
+        eg = ", ".join(_path(u) for u in (d.get("examples_empty") or [])[:3])
+        issues.append(f"{d['empty_tag']} of them render an empty <h1></h1>" + (f" ({eg})" if eg else ""))
     if d.get("multiple"):
         issues.append(f"{d['multiple']} page(s) with several H1s")
     return home + (" — " + ", ".join(issues) if issues else " — one H1 per page")
@@ -80,9 +106,15 @@ def _alt(c: dict) -> str:
     if not total:
         return "No <img> tags found"
     missing = d.get("images_missing_alt", 0)
+    empty = d.get("images_empty_alt", 0)
+    empty_txt = f"; {empty} more use alt=\"\"" if empty else ""
     if not missing:
-        return f"All {total} images have alt text"
-    return f"{missing} of {total} images missing alt text (on {_plural(c.get('pages_affected') or 0, 'page')})"
+        return f"All {total} images have an alt attribute{empty_txt}"
+    text = f"{missing} of {total} images missing alt text (on {_plural(c.get('pages_affected') or 0, 'page')})"
+    tpl = d.get("template_images") or []
+    if tpl:
+        text += " — " + "; ".join(f"{t['src']} alone accounts for {t['pages']} (one shared-template fix)" for t in tpl[:2])
+    return text + empty_txt
 
 
 def _schema(c: dict) -> str:
@@ -120,9 +152,26 @@ def _sitemap(c: dict) -> str:
         return f"Invalid — {c.get('value')} is not a valid XML sitemap"
     parts = [f"sitemap index with {_plural(d.get('child_sitemaps') or 0, 'child sitemap')}"] if d.get("is_index") else []
     if d.get("url_count") is not None:
-        parts.append(_plural(d["url_count"], "URL"))
+        unique = d.get("unique_urls")
+        if unique is not None and unique != d["url_count"]:
+            parts.append(f"{d['url_count']} entries, {unique} unique URLs")
+        else:
+            parts.append(_plural(d["url_count"], "URL"))
     robots = "declared in robots.txt" if d.get("declared_in_robots") else "not declared in robots.txt"
-    return "Present" + (f" ({', '.join(parts)})" if parts else "") + f" — {robots}"
+    text = "Present" + (f" ({', '.join(parts)})" if parts else "") + f" — {robots}"
+    problems = []
+    fixes = d.get("prefix_fixes") or {}
+    if fixes:
+        counts = d.get("prefix_counts") or {}
+        n = sum(counts.get(p, 0) for p in fixes)
+        mapping = ", ".join(f"/{k}/ (should be /{v}/)" for k, v in fixes.items())
+        problems.append(f"{n} entries use locale prefixes the site does not serve: {mapping} — they 404")
+    if d.get("malformed_entries"):
+        eg = (d.get("malformed_examples") or [""])[0]
+        problems.append(f"{d['malformed_entries']} malformed entries (e.g. '{eg}')")
+    if d.get("duplicate_entries"):
+        problems.append(f"{d['duplicate_entries']} duplicate entries")
+    return text + (". BROKEN: " + "; ".join(problems) if problems else "")
 
 
 def _robots(c: dict) -> str:
@@ -137,11 +186,22 @@ def _robots(c: dict) -> str:
 def _analytics(c: dict) -> str:
     if c["status"] == "missing":
         return "None detected"
+    d = c["details"]
+    ids_by_tracker = d.get("ids", d) if isinstance(d.get("ids", d), dict) else {}
+    coverage = d.get("coverage") or {}
+    n = c.get("pages_checked")
     parts = []
-    for key, ids in c["details"].items():
+    for key, ids in ids_by_tracker.items():
         name = TRACKER_NAMES.get(key, key.replace("_", " ").title())
-        parts.append(f"{name} ({', '.join(ids)})" if ids else name)
-    return " + ".join(parts)
+        text = f"{name} ({', '.join(ids)})" if ids else name
+        cov = coverage.get(key)
+        if cov and n and not cov["on_homepage"]:
+            text += f" — inner pages only ({cov['pages']} of {n}), not on the homepage"
+        parts.append(text)
+    text = " + ".join(parts)
+    if coverage and not d.get("google_analytics"):
+        text += ". No Google Analytics 4 / Tag Manager detected"
+    return text
 
 
 def _ssl(c: dict) -> str:
@@ -196,12 +256,43 @@ def _broken(c: dict) -> str:
     d = c["details"]
     if c["status"] == "present":
         return f"None found in {_plural(c.get('pages_checked') or 0, 'crawled URL')}"
+    if d.get("diagnosis") == "sitemap_wrong_locale_prefix":
+        fixes = ", ".join(f"/{k}/ -> /{v}/" for k, v in (d.get("prefix_fixes") or {}).items())
+        return (f"{d.get('in_sitemap')} of {d.get('sitemap_urls_fetched')} sitemap URLs sampled return 404, all "
+                f"caused by a wrong locale prefix in the sitemap ({fixes}); no broken links found on the pages "
+                "themselves")
     parts = []
     if d.get("in_sitemap"):
         parts.append(f"{d['in_sitemap']} of {d['sitemap_urls_fetched']} sitemap URLs fetched")
     if d.get("linked_from_homepage"):
         parts.append(f"{d['linked_from_homepage']} linked from the homepage")
     return f"{_plural(c.get('value') or 0, 'URL')} return 404/410 ({'; '.join(parts)}) — sample only"
+
+
+def _not_found(c: dict) -> str:
+    d = c["details"]
+    shells = d.get("empty_template_pages") or 0
+    eg = ", ".join(_path(u) for u in (d.get("examples_empty_template") or [])[:4])
+    shell_txt = f"; {shells} of the {c.get('pages_checked')} sampled pages are that empty shell ({eg})" if shells else ""
+    if c["status"] == "missing":
+        probe = next((p for p in reversed(d.get("probes") or []) if p.get("status_code") == 200), {})
+        return (f"CRITICAL — unknown URLs return HTTP 200 instead of 404 ({_path(probe.get('url'))} -> 200, "
+                f"title '{probe.get('title') or ''}'), so every junk URL is an indexable empty page{shell_txt}")
+    if c["status"] == "partial":
+        return f"Unknown URLs return {c.get('value')}, but{shell_txt[1:]}"
+    return f"OK — unknown URLs return HTTP {c.get('value')}"
+
+
+def _hreflang(c: dict) -> str:
+    d = c.get("details") or {}
+    if c.get("value"):
+        return "Present (" + ", ".join(c["value"]) + ")"
+    if d.get("multilingual"):
+        langs = d.get("html_lang_by_prefix") or {}
+        per = "; ".join(f"/{k}/ declares lang={'/'.join(v)}" for k, v in langs.items())
+        return ("MISSING — language versions " + ", ".join(f"/{p}/" for p in d.get("locale_prefixes", []))
+                + " exist with no hreflang between them" + (f" ({per})" if per else ""))
+    return "Not needed (single-language site)"
 
 
 def _indexability(c: dict) -> str:
@@ -223,6 +314,7 @@ FORMATTERS = (
     ("schema_markup", "schema_markup", lambda c, _: _schema(c)),
     ("canonical_urls", "canonical", lambda c, _: _canonical(c)),
     ("indexability", "indexability", lambda c, _: _indexability(c)),
+    ("soft_404", "not_found_handling", lambda c, _: _not_found(c)),
     ("sitemap", "sitemap", lambda c, _: _sitemap(c)),
     ("robots_txt", "robots_txt", lambda c, _: _robots(c)),
     ("analytics", "analytics", lambda c, _: _analytics(c)),
@@ -231,6 +323,7 @@ FORMATTERS = (
     ("platform", "platform", lambda c, _: _platform(c)),
     ("cookie_banner", "cookie_banner", lambda c, _: _cookie(c)),
     ("lang", "lang", lambda c, _: _lang(c)),
+    ("hreflang", "hreflang", lambda c, _: _hreflang(c)),
     ("broken_links", "broken_links", lambda c, _: _broken(c)),
 )
 
@@ -273,21 +366,35 @@ def _blog(report: dict) -> str:
 
 def _coverage(report: dict) -> str:
     crawl, cs = report["crawl"], report["content_stats"]
-    total = crawl.get("sitemap", {}).get("url_count")
-    text = f"{cs['pages_analyzed']} pages analyzed" + (f" of {total} URLs in the sitemap" if total else "")
+    sm = crawl.get("sitemap", {})
+    total, unique = sm.get("url_count"), sm.get("unique_urls")
+    text = f"{cs['pages_analyzed']} pages analyzed"
+    if unique and unique != total:
+        text += f" of {unique} unique sitemap URLs ({total} entries)"
+    elif total:
+        text += f" of {total} URLs in the sitemap"
+    shells = cs.get("empty_template_pages") or 0
+    if shells:
+        text += f"; {shells} of them are empty template pages, so {cs['pages_analyzed'] - shells} have real content"
     text += f"; {crawl['pages_attempted']} fetched, {crawl['pages_failed']} failed"
     if crawl.get("pages_blocked"):
         text += f", {crawl['pages_blocked']} blocked"
     return text
 
 
-def _wins(report: dict) -> tuple[list[dict], list[dict]]:
-    quick, projects = [], []
-    for q in report["quick_wins"]:
-        item = {"action": q["action"], "priority": q["priority"], "effort": q["effort"],
-                "category": q["category"], "source": q["source"]}
-        (projects if q["effort"] == "high" else quick).append(item)
-    return quick, projects
+MAX_QUICK_WINS = 12
+MIN_LLM_WINS = 3
+
+
+def _wins(report: dict) -> list[str]:
+    """Plain action strings, most important first. Keeps a few LLM (content/strategy) wins in the list."""
+    wins = list(enumerate(report["quick_wins"]))
+    llm = [w for w in wins if w[1]["source"] == "llm"]
+    rule = [w for w in wins if w[1]["source"] != "llm"]
+    llm_in_top = sum(q["source"] == "llm" for _, q in wins[:MAX_QUICK_WINS])
+    llm_quota = min(len(llm), max(MIN_LLM_WINS, llm_in_top))
+    chosen = sorted(rule[:MAX_QUICK_WINS - llm_quota] + llm[:llm_quota])
+    return [q["action"] for _, q in chosen]
 
 
 def _llm_missing(llm: dict) -> str:
@@ -307,8 +414,14 @@ def summarize(report: dict) -> dict[str, Any]:
 
     llm_ok = llm["status"] == "ok"
     cs = report["content_stats"]
-    quick, projects = _wins(report)
     loc = report.get("locale") or {}
+    shells = cs.get("empty_template_pages") or 0
+    pages = (f"{cs['pages_analyzed'] - shells} pages with real content, avg {cs['avg_word_count']} words of "
+             "page-specific text (menus/footers repeated across pages excluded)"
+             + (f", {cs['thin_pages']} thin (<300 words)" if cs.get("thin_pages") else "")
+             + (f"; {shells} empty template pages excluded" if shells else ""))
+    severity = {"high": 0, "medium": 1, "low": 2}
+    findings = [f["message"] for f in sorted(report.get("findings") or [], key=lambda f: severity[f["severity"]])]
     return {
         "site": report["site"],
         "company": report.get("company"),
@@ -320,15 +433,14 @@ def summarize(report: dict) -> dict[str, Any]:
         "overall_rating": _rating(report),
         "score_caveats": report["score"].get("caveats") or [],
         "technical_seo": technical,
+        "site_specific_findings": findings,
         "content_seo": {
             "keyword_strategy": llm.get("keyword_strategy") if llm_ok else _llm_missing(llm),
             "captured_keywords": llm.get("captured_keywords") or [],
             "missed_keywords": [k["keyword"] for k in llm.get("missed_keywords") or []],
-            "pages": (f"{cs['pages_analyzed']} pages analyzed, avg {cs['avg_word_count']} words"
-                      + (f", {cs['thin_pages']} thin (<300 words)" if cs.get("thin_pages") else "")),
+            "pages": pages,
             "blog": _blog(report),
         },
         "competitive_seo_position": llm.get("competitive_position") if llm_ok else _llm_missing(llm),
-        "quick_wins": quick,
-        "larger_projects": projects,
+        "quick_wins": _wins(report),
     }
