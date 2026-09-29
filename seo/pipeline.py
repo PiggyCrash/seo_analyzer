@@ -95,7 +95,7 @@ class SEOPipeline:
 
         tech, content, locale = rollup(records, summary)
         findings = build_findings(records, summary, tech)
-        score = compute_score(tech, content.pages_analyzed, findings)
+        score = compute_score(tech, content.pages_analyzed, findings, content)
         rule_wins = rule_quick_wins(tech, content, findings)
         site = crawl.site_key
         llm, llm_wins = await self._run_llm(site, summary, tech, content, locale, records, rule_wins, findings,
@@ -107,6 +107,9 @@ class SEOPipeline:
         company = llm.company or _brand(records) or _domain_name(site)
         before = llm.model_dump()
         llm = fallback.fill(llm, records, tech, content, locale, findings, score, summary, site, company)
+        if not llm.executive_summary:
+            llm = llm.model_copy(update={"executive_summary": fallback.executive_summary(
+                sort_wins(rule_wins + llm_wins), findings)})
         filled = [k for k, v in llm.model_dump().items() if v != before.get(k)]
         if filled:
             llm = llm.model_copy(update={"rule_filled": filled})

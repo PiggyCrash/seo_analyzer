@@ -6,7 +6,7 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-SCHEMA_VERSION = "1.4"
+SCHEMA_VERSION = "1.5"
 
 CheckStatus = Literal["present", "missing", "partial", "not_checked", "error"]
 
@@ -349,12 +349,20 @@ class LLMOutput(BaseModel):
     company: Optional[str] = None
     sector: Optional[str] = None
     summary: Optional[str] = None
+    executive_summary: list[str] = Field(default_factory=list)
     keyword_strategy: Optional[str] = None
     captured_keywords: list[str] = Field(default_factory=list)
     missed_keywords: list[KeywordSuggestion] = Field(default_factory=list)
     content_assessment: Optional[str] = None
     competitive_position: Optional[str] = None
     quick_wins: list[QuickWin] = Field(default_factory=list)
+
+    @field_validator("executive_summary", mode="before")
+    @classmethod
+    def _es(cls, v):
+        if isinstance(v, str):
+            v = [v]
+        return [str(x).strip() for x in v if str(x).strip()][:3] if isinstance(v, list) else []
 
     @field_validator("captured_keywords", mode="before")
     @classmethod
@@ -400,6 +408,7 @@ class LLMAnalysis(BaseModel):
     company: Optional[str] = None
     sector: Optional[str] = None
     summary: Optional[str] = None
+    executive_summary: list[str] = Field(default_factory=list)
     keyword_strategy: Optional[str] = None
     captured_keywords: list[str] = Field(default_factory=list)
     missed_keywords: list[KeywordSuggestion] = Field(default_factory=list)

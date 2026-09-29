@@ -19,13 +19,40 @@ WEIGHTS = {
 # with the findings. Low-severity findings are cosmetic and cost nothing.
 FINDING_PENALTY = {"high": 5, "medium": 2, "low": 0}
 MAX_FINDING_PENALTY = 20
+# Content gaps an expert would mark down even when the tags are clean.
+MAX_CONTENT_PENALTY = 12
+MAX_TOTAL_PENALTY = 25
+COMMERCIAL_TYPES = ("service", "pricing", "case_study")
+
+
+def content_gaps(content: Optional[ContentStats]) -> list[tuple[int, str]]:
+    """(points, reason) for weak content in the sample: thin pages, no service pages, no content hub."""
+    if content is None or not content.pages_analyzed:
+        return []
+    real = max(1, content.pages_analyzed - content.empty_template_pages)
+    gaps = []
+    thin = content.thin_pages / real
+    if thin >= 0.5:
+        gaps.append((6, f"{content.thin_pages} of {real} pages are thin (<300 words)"))
+    elif thin >= 0.3:
+        gaps.append((4, f"{content.thin_pages} of {real} pages are thin (<300 words)"))
+    if content.avg_word_count < 250:
+        gaps.append((3, f"pages average only {content.avg_word_count} words of own text"))
+    if not any(content.page_types.get(t) for t in COMMERCIAL_TYPES):
+        gaps.append((3, "no dedicated service, product or case-study pages in the sample"))
+    if not content.blog_detected or (not content.blog_posts_crawled and not content.sitemap_blog_urls):
+        gaps.append((2, "no active blog or news section"))
+    if content.empty_template_pages:
+        gaps.append((3, f"{content.empty_template_pages} empty template page(s)"))
+    return gaps
 EARN = {"present": 1.0, "partial": 0.5, "missing": 0.0, "error": 0.0}
 LABELS = ((85, "Excellent"), (70, "Good"), (50, "Fair"), (30, "Weak"), (0, "Poor"))
 MIN_COVERAGE = 0.5
 CONFIDENCE_PAGES = ((10, "high"), (5, "medium"), (1, "low"))
 
 
-def compute_score(tech: TechnicalSEO, pages_scored: int = 0, findings: Iterable[Finding] = ()) -> Score:
+def compute_score(tech: TechnicalSEO, pages_scored: int = 0, findings: Iterable[Finding] = (),
+                  content: Optional[ContentStats] = None) -> Score:
     breakdown, available, earned = {}, 0.0, 0.0
     for name, weight in WEIGHTS.items():
         check: Check = getattr(tech, name)
@@ -45,14 +72,23 @@ def compute_score(tech: TechnicalSEO, pages_scored: int = 0, findings: Iterable[
     technical = round(100 * earned / available)
     hits = [f for f in findings if FINDING_PENALTY[f.severity]]
     penalty = min(MAX_FINDING_PENALTY, sum(FINDING_PENALTY[f.severity] for f in hits))
-    value = max(0, technical - penalty)
-    penalties = [f"-{FINDING_PENALTY[f.severity]} {f.type.replace('_', ' ')}" for f in hits]
+    gaps = content_gaps(content)
+    content_penalty = min(MAX_CONTENT_PENALTY, sum(p for p, _ in gaps))
+    total = min(MAX_TOTAL_PENALTY, penalty + content_penalty)
+    value = max(0, technical - total)
+    penalties = [f"-{FINDING_PENALTY[f.severity]} {f.type.replace('_', ' ')}" for f in hits] + \
+        [f"-{p} content: {why}" for p, why in gaps]
     label = next(l for threshold, l in LABELS if value >= threshold)
     confidence = next((c for threshold, c in CONFIDENCE_PAGES if pages_scored >= threshold), "none")
-    caveats = ["Technical hygiene plus site-specific defects: content quality, rankings and backlinks are not measured"]
-    if penalty:
-        caveats.append(f"Technical hygiene {technical}/100, minus {penalty} for site-specific defects "
-                       f"({', '.join(p.split(' ', 1)[1] for p in penalties[:4])})")
+    caveats = ["Technical hygiene, site-specific defects and content gaps: rankings and backlinks are not measured"]
+    if total:
+        parts = []
+        if penalty:
+            parts.append(f"{penalty} for site-specific defects ({', '.join(f.type.replace('_', ' ') for f in hits[:4])})")
+        if content_penalty:
+            parts.append(f"{content_penalty} for content gaps ({'; '.join(why for _, why in gaps[:3])})")
+        capped = " (capped)" if total < penalty + content_penalty else ""
+        caveats.append(f"Technical hygiene {technical}/100, minus " + " and ".join(parts) + capped)
     if confidence in ("low", "none"):
         caveats.insert(0, f"Based on only {pages_scored} page(s); site-wide conclusions are unreliable")
     missing_core = [n for n in ("schema_markup", "h1", "robots_txt", "meta_title", "meta_description")

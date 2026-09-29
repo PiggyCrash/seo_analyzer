@@ -224,6 +224,23 @@ def fill(llm: LLMAnalysis, records: list[PageRecord], tech: TechnicalSEO, conten
     })
 
 
+def headline(text: str, limit: int = 140) -> str:
+    """First clause of an action, cut at a clause boundary: short enough to scan."""
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    for sep in ("; ", " — ", ": ", ", "):
+        cut = text[:limit].rfind(sep)
+        if cut > limit * 0.5:
+            return text[:cut].rstrip(" ,;:—")
+    return text[:limit].rsplit(" ", 1)[0] + "…"
+
+
+def executive_summary(wins, findings: list[Finding]) -> list[str]:
+    """Three bullets from the highest-priority quick wins (already ranked), for when no LLM wrote them."""
+    return [headline(q.action, 120) for q in list(wins)[:3]]
+
+
 def entity_rich_content(schema_details: dict, company: Optional[str] = None) -> str:
     """Coworker-style 'entity_rich_content': what the structured data says about the organisation."""
     d = schema_details or {}

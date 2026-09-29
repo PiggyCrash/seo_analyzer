@@ -102,6 +102,7 @@ Required JSON shape:
   "company": "company/brand name or null",
   "sector": "short sector description",
   "summary": "2-3 sentence overall SEO assessment, mentioning the sample size if it is small",
+  "executive_summary": ["exactly 3 bullets, max 25 words each: the three problems or opportunities that matter most for THIS business, most important first, each naming the page, element or value"],
   "keyword_strategy": "how the site currently targets search, if at all",
   "captured_keywords": ["3-8 keywords/topics the site already targets, evidenced by titles, headings or copy"],
   "missed_keywords": [{"keyword": "string", "intent": "informational|commercial|transactional|navigational", "rationale": "why it fits this site"}],

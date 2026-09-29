@@ -10,7 +10,7 @@ from typing import Any, Optional
 from urllib.parse import urlparse
 
 from .extractor import NAV_HEADING, TRACKER_NAMES
-from .fallback import entity_rich_content
+from .fallback import entity_rich_content, headline
 
 SEO_PLUGINS = ("Rank Math", "Yoast SEO", "All in One SEO", "SEOPress")
 COUNTRY_LABEL = {"ID": "Indonesia", "SG": "Singapore", "MY": "Malaysia", "TH": "Thailand", "PH": "Philippines",
@@ -494,6 +494,7 @@ def _coverage(report: dict) -> str:
 
 
 MAX_QUICK_WINS = 12
+QUICK_WIN_CHARS = 180  # summary only; the full text stays in output/history/
 MIN_LLM_WINS = 3
 
 
@@ -505,7 +506,7 @@ def _wins(report: dict) -> list[str]:
     llm_in_top = sum(q["source"] == "llm" for _, q in wins[:MAX_QUICK_WINS])
     llm_quota = min(len(llm), max(MIN_LLM_WINS, llm_in_top))
     chosen = sorted(rule[:MAX_QUICK_WINS - llm_quota] + llm[:llm_quota])
-    return [q["action"] for _, q in chosen]
+    return [headline(q["action"], QUICK_WIN_CHARS) for _, q in chosen]
 
 
 def _llm_missing(llm: dict) -> str:
@@ -552,6 +553,8 @@ def summarize(report: dict) -> dict[str, Any]:
         "country": country,
         "data_coverage": _coverage(report),
         "overall_rating": _rating(report),
+        "executive_summary": llm.get("executive_summary") or [headline(q["action"], 120)
+                                                              for q in report["quick_wins"][:3]],
         "score_caveats": report["score"].get("caveats") or [],
         "technical_seo": technical,
         "site_specific_findings": findings,

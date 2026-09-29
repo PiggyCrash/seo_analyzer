@@ -1,6 +1,6 @@
 # SEO Analyzer
 
-Crawls a website (homepage + ~15 key pages) and runs deterministic SEO checks. Then an LLM (Groq's free tier by default; any OpenAI-compatible API such as MiniMax or Cerebras works) interprets the results, and everything is exported as validated JSON. It scales from 1 site to thousands.
+Crawls a website (homepage + ~15 key pages) and runs deterministic SEO checks. Then an LLM (MiniMax-M3 by default, Groq's free tier as fallback; any OpenAI-compatible API works) interprets the results, and everything is exported as validated JSON. It scales from 1 site to thousands.
 
 ```
 URL -> crawler -> extractor (facts) -> score + rule quick wins -> LLM (interpretation) -> JSON
@@ -15,10 +15,10 @@ cd C:\Users\gashandyd\Downloads\Project\seo_analysis
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-copy .env.example .env      # then put your GROQ_API_KEY in .env (free: console.groq.com/keys)
+copy .env.example .env      # then put MINIMAX_API_KEY (and GROQ_API_KEY for the fallback) in .env
 ```
 
-Open `config.yaml` and set `crawl.user_agent` to include your real contact email. Also check that `llm.model` matches a model your key can use (`GET https://api.groq.com/openai/v1/models`). Groq's free tier allows 8,000 tokens/minute, so the defaults run about one LLM call per minute. To use MiniMax or Cerebras instead, switch the commented `llm.*` lines in `config.yaml`.
+Open `config.yaml` and set `crawl.user_agent` to include your real contact email. Also check that `llm.model` matches a model your key can use (`GET https://api.minimax.io/v1/models`). `config.yaml` uses MiniMax-M3 with Groq as `llm.fallback`; `config.groq.yaml` does the reverse (`--config config.groq.yaml`). Groq's free tier allows 8,000 tokens/minute, so it runs about one LLM call per minute.
 
 ## Usage
 
@@ -56,23 +56,57 @@ output/index.jsonl                     one summary line per run: load this for d
 cache/<site>/<timestamp>/              raw HTML + crawl metadata (used by --reanalyze)
 ```
 
-Each check has a fixed `status`: `present | partial | missing | not_checked | error`. `not_checked` always comes with a `reason`. **A blocked page is never reported as "missing".** Each report records `schema_version`, `tool_version` and the model used, so runs stay comparable.
+### Checks
 
-The score is computed from weighted checks (`seo/scoring.py`) and is reproducible. If less than 50% of the weighted checks could be verified, the score is `null` with the label "Insufficient data". It also has a `confidence` (`high` ≥10 pages, `medium` ≥5, `low` below that) and `caveats`, and the summary's `overall_rating` says LOW CONFIDENCE when only a few pages loaded. Site-specific findings then lower it: -5 per high-severity finding (placeholder text, typo, broken contact links, duplicate pages...) and -2 per medium one, at most -20; `score.technical_value` keeps the pure hygiene number. It does not measure content quality or rankings.
+- Each check has a fixed `status`: `present | partial | missing | not_checked | error`.
+- `not_checked` always comes with a `reason`. **A blocked page is never reported as "missing".**
+- Each report records `schema_version`, `tool_version` and the model used, so runs stay comparable.
+- The crawler also requests a URL that cannot exist (at the root and under the main locale prefix, e.g. `/id/seo-probe-xxxx`):
+  - a 200 answer is reported as `soft_404`;
+  - crawled pages that match that empty template are marked `empty_template` and left out of content stats.
+- The sitemap check reports duplicate, malformed and truncated entries, dead child sitemaps, page-builder template sitemaps and the obsolete 0.84 namespace. For dead URLs under a locale prefix (`/en-GB/`) it retries the same slug under the prefixes the site does serve (`/en/`), so a sitemap-generator bug is not reported as broken links.
+- `broken_links` reports 404/410 URLs among the crawled pages plus a spread-out sample of sitemap URLs.
+- `internal_linking` reports card grids whose "Read More" links all point to one listing page, sampled pages nothing links to, the share of generic anchors, and internal nofollow links.
+- Word counts and LLM excerpts use page-specific text only: text repeated on at least half of the crawled pages (menus, footers) is removed, even on sites that do not use `<nav>`/`<footer>` tags.
+- An empty `<h1></h1>` counts as no H1.
 
-No summary field is left empty. If the main LLM fails, the `llm.fallback` provider in `config.yaml` is tried (Groq falls back to MiniMax and vice versa). If both fail or the LLM is off, `seo/fallback.py` fills sector, keyword strategy, captured/missed keywords, competitive position and the summary from the measured facts; those texts say "(rule-based ...)" and the full report lists them in `llm_analysis.rule_filled`.
+### Score
 
-Each report has a `locale` (country from the TLD, or from the detected content language, plus the matching privacy law, e.g. `.co.id` → UU PDP, `.sg` → PDPA, EU → GDPR). The cookie-banner finding and the LLM prompt both use it. The `lang` check compares `<html lang>` with the detected content language, and `broken_links` reports 404/410 URLs among the crawled pages plus a spread-out sample of sitemap URLs.
+- Computed from weighted checks (`seo/scoring.py`) and reproducible: the same crawl always gives the same score.
+- Deductions, so the number agrees with what an expert sees (total at most -25):
+  - site-specific findings: -5 per high-severity finding (placeholder text, typo, broken contact links, duplicate pages...), -2 per medium one, at most -20;
+  - content gaps: thin pages (-4/-6), under 250 words per page on average (-3), no service/product/case-study pages in the sample (-3), no active blog or news (-2), empty template pages (-3), at most -12.
+- `score.technical_value` keeps the pure technical-hygiene number, `score.penalties` lists every deduction, and a caveat explains them in one sentence.
+- `null` with the label "Insufficient data" when less than 50% of the weighted checks could be verified.
+- `confidence`: `high` ≥10 pages, `medium` ≥5, `low` below that. The summary's `overall_rating` says LOW CONFIDENCE when only a few pages loaded.
+- Rankings, backlinks and search volume are not measured.
 
-The crawler also requests a URL that cannot exist (at the root and under the main locale prefix, e.g. `/id/seo-probe-xxxx`). A 200 answer is reported as `soft_404`, and crawled pages that match that empty template are marked `empty_template` and left out of content stats. The sitemap check reports duplicate and malformed entries, and for dead URLs under a locale prefix (`/en-GB/`) it retries the same slug under the prefixes the site does serve (`/en/`), so a sitemap-generator bug is not reported as broken links.
+### Summary fields
 
-Word counts and LLM excerpts use page-specific text only: text repeated on at least half of the crawled pages (menus, footers) is removed, even on sites that do not use `<nav>`/`<footer>` tags. An empty `<h1></h1>` counts as no H1.
+- No summary field is left empty:
+  - if the main LLM fails, the `llm.fallback` provider in `config.yaml` is tried (MiniMax falls back to Groq);
+  - if both fail or the LLM is off, `seo/fallback.py` fills sector, keyword strategy, captured/missed keywords, competitive position, the summary and the executive summary from the measured facts;
+  - those texts say "(rule-based ...)", and the full report lists them in `llm_analysis.rule_filled`.
+- `executive_summary`: the three things that matter most for the business, in one short line each.
+- `site_specific_findings`: observations the generic checks cannot express, each with evidence (URL, value or exact text). Examples: JavaScript-only counters that ship as "0 +", a heading that spells a name differently from the menu, placeholder content, visible typos, broken `mailto` links, leaked debug headers, structured-data defects, duplicate `-0` CMS pages.
+- `quick_wins`: up to 12 actions, ranked by priority and effort, at least 3 of them from the LLM when it produced them.
+  - Rule wins name the exact URL, file, value or text involved (e.g. "Add alt text to logo_bio.png in the shared template (missing on 15 of 15 pages)").
+  - The summary cuts each win at a clause boundary (about 180 characters); the full text, `priority`, `effort`, `category` and `source` (`rule` or `llm`) stay in the full report.
+- `country`: from the TLD, the structured-data address, then phone prefixes; "Not determined" when there is no signal. The matching privacy law (e.g. `.co.id` → UU PDP, `.sg` → PDPA, EU → GDPR) is used by the cookie-banner finding and the LLM prompt.
+- `content_seo.entity_rich_content`, `technical_seo.seo_plugin` and `technical_seo.internal_linking` follow the fields of the manual reference reports.
 
-`site_specific_findings` lists observations the generic checks cannot express, each with evidence: JavaScript-only counters that ship as "0 +", a name spelled differently in a heading and the menu, debug/version response headers, placeholder content, stale copyright years, headings used for layout or wrapping a phone number, empty meta tags, trackers missing on the homepage, no Google Analytics.
+### LLM input and filtering
 
-Quick wins have `source: "rule"` (derived from the facts) or `source: "llm"` (strategy/content), plus `priority`, `effort` and `category` (kept in the full report). Rule wins name the exact URL, file, value or text involved (e.g. "Add alt text to logo_bio.png in the shared template (missing on 15 of 15 pages)"). The summary lists up to 12 quick wins as plain action strings, ranked by priority and effort, with at least 3 LLM wins when the LLM produced them. LLM keyword suggestions are tagged `llm_suggested` because they are hypotheses, not search-volume data.
-
-The LLM receives today's date, the country, the content language, the privacy law, the sample size, the findings and the non-social domains the homepage links to (`related_domains`). Its output is filtered afterwards: quick wins without `evidence`, wins that restate a rule-based win, keywords or wins containing a past year, navigation labels passed off as captured keywords, and keywords/wins for an intent a sister site of the same brand already serves (kimiafarma.co.id → kimiafarmaapotek.co.id owns "apotek") are dropped. An LLM schema win replaces the generic rule schema win, because the LLM can name the legal entity, ticker and parent company.
+- The LLM receives today's date, the country, the content language, the privacy law, the sample size, the findings, the pages linked from the homepage (`existing_paths`) and the non-social domains it links to (`related_domains`).
+- Its output is checked and corrected (up to two correction rounds for broken JSON, non-English prose or JSON fragments in keyword lists).
+- Dropped afterwards:
+  - quick wins without `evidence`, or that restate a rule-based win;
+  - keywords or wins containing a past year;
+  - navigation labels passed off as captured keywords;
+  - pages it proposes to create that already exist;
+  - keywords/wins for an intent a sister site of the same brand already serves (kimiafarma.co.id → kimiafarmaapotek.co.id owns "apotek").
+- An LLM Organization-schema win replaces the generic rule schema win, because the LLM can name the legal entity, ticker and parent company.
+- Keyword suggestions are tagged `llm_suggested`: they are hypotheses, not search-volume data.
 
 ## When the API key runs out
 
