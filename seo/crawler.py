@@ -18,8 +18,8 @@ from bs4 import BeautifulSoup
 
 from .blockers import detect_blocker, has_hard_block_signal, page_flags
 from .config import CrawlConfig
-from .schema import (BlockerCount, BrokenURL, CrawlSummary, HttpsInfo, NotFoundProbe, PageFetch, RobotsInfo,
-                     SitemapInfo)
+from .schema import (BlockerCount, BrokenURL, CrawlSummary, DuplicateSlug, HttpsInfo, NotFoundProbe, PageFetch,
+                     RobotsInfo, SitemapInfo, TagManagerInfo)
 from .urlutils import (bare_host, classify_path, in_scope, is_crawlable, locale_prefix, normalize_input,
                        normalize_url, origin_candidates, origin_of, site_key, swap_locale_prefix)
 
@@ -92,6 +92,8 @@ class CrawlResult:
     sitemap: SitemapInfo = field(default_factory=SitemapInfo)
     https: Optional[HttpsInfo] = None
     not_found_probes: list = field(default_factory=list)
+    duplicate_slugs: list = field(default_factory=list)
+    tag_manager: Optional[TagManagerInfo] = None
     budget_exceeded: Optional[str] = None
     stopped_early: Optional[str] = None
     duration_seconds: float = 0.0
@@ -138,7 +140,8 @@ class CrawlResult:
                                      for p in self.pages),
             flags=flags, budget_exceeded=self.budget_exceeded, stopped_early=self.stopped_early,
             robots=self.robots, sitemap=self.sitemap, https=self.https,
-            not_found_probes=self.not_found_probes,
+            not_found_probes=self.not_found_probes, duplicate_slugs=self.duplicate_slugs,
+            tag_manager=self.tag_manager,
             duration_seconds=self.duration_seconds, user_agent=self.user_agent)
 
     def to_cache(self) -> dict:
@@ -148,6 +151,8 @@ class CrawlResult:
                 "robots": self.robots.model_dump(), "sitemap": self.sitemap.model_dump(),
                 "https": self.https.model_dump() if self.https else None,
                 "not_found_probes": [p.model_dump() for p in self.not_found_probes],
+                "duplicate_slugs": [d.model_dump() for d in self.duplicate_slugs],
+                "tag_manager": self.tag_manager.model_dump() if self.tag_manager else None,
                 "budget_exceeded": self.budget_exceeded, "stopped_early": self.stopped_early,
                 "duration_seconds": self.duration_seconds,
                 "pages": [p.to_cache() for p in self.pages]}
@@ -161,6 +166,8 @@ class CrawlResult:
                 sitemap=SitemapInfo(**(d.get("sitemap") or {})),
                 https=HttpsInfo(**d["https"]) if d.get("https") else None,
                 not_found_probes=[NotFoundProbe(**p) for p in d.get("not_found_probes") or []],
+                duplicate_slugs=[DuplicateSlug(**x) for x in d.get("duplicate_slugs") or []],
+                tag_manager=TagManagerInfo(**d["tag_manager"]) if d.get("tag_manager") else None,
                 budget_exceeded=d.get("budget_exceeded"), stopped_early=d.get("stopped_early"),
                 duration_seconds=d.get("duration_seconds", 0.0))
         r.pages = [FetchResult.from_cache(p, t) for p, t in zip(d.get("pages", []), texts)]
@@ -326,6 +333,72 @@ def probe_sample(urls: list[str], exclude: set[str], n: int) -> list[str]:
     return (picked + rest[::step])[:n]
 
 
+# Page-builder template post types that should never be public (Royal Addons, Elementor, Divi, Astra, ...).
+TEMPLATE_SITEMAP = re.compile(r"(wpr_templates|elementor_library|elementor-hf|et_pb_layout|astra-advanced-hook"
+                              r"|jet-theme-core|ct_template|fl-builder-template|oceanwp_library|elementskit_template"
+                              r"|ae_global_templates|jkit-template)[-_]?sitemap", re.I)
+SITEMAP_GOOD = re.compile(r"cms|page|post|blog|news|main|article|sitemap(_index)?\.xml$", re.I)
+SITEMAP_NOISE = re.compile(r"product|download|document|faq|image|video|google-|category|tag|author|feed", re.I)
+
+
+def rank_sitemaps(urls: list[str], home_url: Optional[str]) -> list[str]:
+    """Best sitemaps first: same path prefix as the homepage (/sg/en/ on a multi-country site), then
+    content sitemaps (cms, pages, posts) before product/download/image feeds."""
+    home_segs = [s for s in urlparse(home_url or "").path.split("/") if s][:2]
+
+    def key(u: str):
+        segs = [s for s in urlparse(u).path.split("/") if s]
+        shared = 0
+        for a, b in zip(home_segs, segs):
+            if a.lower() != b.lower():
+                break
+            shared += 1
+        return (-shared, bool(SITEMAP_NOISE.search(u)), not SITEMAP_GOOD.search(u), len(u), u)
+    return sorted(dict.fromkeys(urls), key=key)
+
+
+def _count_hreflang(body: bytes) -> int:
+    if body[:2] == b"\x1f\x8b":
+        try:
+            body = gzip.decompress(body)
+        except OSError:
+            return 0
+    return body.count(b"hreflang=")
+
+
+_Q = r"\\*[\"']"  # a quote, possibly JS-escaped inside the container's JSON
+GTM_PATTERNS = {
+    "ga4": re.compile(r"\b(G-[A-Z0-9]{6,12})\b"),
+    "google_ads": re.compile(r"\b(AW-\d{6,12})\b"),
+    "universal_analytics": re.compile(r"\b(UA-\d{4,10}-\d{1,4})\b"),
+    "meta_pixel": re.compile(rf"fbq\({_Q}init{_Q}\s*,\s*{_Q}(\d{{10,20}}){_Q}|{_Q}vtp_pixelIds?{_Q}\s*[:,]\s*{_Q}(\d{{10,20}})"),
+    "linkedin_insight": re.compile(rf"_linkedin_partner_id\s*=\s*{_Q}?(\d{{4,10}})|{_Q}function{_Q}:{_Q}__bzi{_Q}[^}}]*?"
+                                   rf"{_Q}vtp_id{_Q}:{_Q}(\d{{4,10}})"),
+    "tiktok_pixel": re.compile(rf"ttq\.load\({_Q}([A-Z0-9]{{15,30}}){_Q}"),
+    "hotjar": re.compile(r"hjid\s*:\s*(\d{5,9})"),
+    "microsoft_clarity": re.compile(rf"clarity{_Q}\s*,\s*{_Q}script{_Q}\s*,\s*{_Q}([a-z0-9]{{8,12}}){_Q}"),
+}
+DUPLICATE_SLUG = re.compile(r"^(?P<base>/.+?)-(?P<n>\d{1,2})/?$")
+
+
+def duplicate_slug_pairs(home: FetchResult) -> list[tuple[str, str]]:
+    """Homepage links like /projects/woodfibre-lng and /projects/woodfibre-lng-0 (CMS duplicate aliases)."""
+    host = bare_host(urlparse(home.final_url or home.url).hostname)
+    paths = set()
+    for a in home.soup.find_all("a", href=True) if home.soup else []:
+        u = normalize_url(a["href"], base=home.final_url)
+        if u and bare_host(urlparse(u).hostname) == host:
+            paths.add(urlparse(u).path.rstrip("/") or "/")
+    pairs = []
+    for p in sorted(paths):
+        m = DUPLICATE_SLUG.match(p)
+        # "-0".."-9" suffixes are CMS counters (Drupal, WordPress); the base URL is checked even when unlinked.
+        if m and len(m.group("n")) == 1 and not re.search(r"\d{2,}$", m.group("base")):
+            pairs.append((m.group("base"), p))
+    pairs.sort(key=lambda ab: ab[0] not in paths)
+    return pairs
+
+
 def _home_link_prefixes(home: FetchResult) -> list[str]:
     """Locale prefixes of the homepage's same-site links (one entry per link, www and non-www alike)."""
     host = bare_host(urlparse(home.final_url or home.url).hostname)
@@ -345,9 +418,11 @@ def sitemap_hygiene(raw_locs: list[str]) -> dict:
         if not p.scheme or not p.hostname or "//" in p.path or re.search(r"https?:", p.path) or " " in u:
             malformed.append(u)
     prefixes = Counter(locale_prefix(u) or "(none)" for u in raw_locs)
+    truncated = [u for u in dict.fromkeys(raw_locs) if urlparse(u).path.rstrip("/").endswith("-")]
     return {"unique_urls": len(set(raw_locs)), "duplicate_entries": len(raw_locs) - len(set(raw_locs)),
             "malformed_entries": len(malformed), "malformed_examples": list(dict.fromkeys(malformed))[:5],
-            "prefix_counts": dict(prefixes.most_common(8))}
+            "prefix_counts": dict(prefixes.most_common(8)),
+            "truncated_slugs": len(truncated), "truncated_examples": truncated[:3]}
 
 
 class _SiteSession:
@@ -524,8 +599,9 @@ class _SiteSession:
             info.http_redirects_to_https = False
         return info
 
-    async def _discover_sitemap(self, origin: str, declared: list[str]) -> tuple[SitemapInfo, list[str]]:
-        tries = declared[:3] or [origin + "/sitemap.xml", origin + "/sitemap_index.xml"]
+    async def _discover_sitemap(self, origin: str, declared: list[str],
+                                home_url: Optional[str] = None) -> tuple[SitemapInfo, list[str]]:
+        tries = rank_sitemaps(declared, home_url)[:3] or [origin + "/sitemap.xml", origin + "/sitemap_index.xml"]
         invalid_url = None
         for url in tries:
             if not self._allowed(url):
@@ -541,20 +617,38 @@ class _SiteSession:
                 continue
             is_index, locs = parsed
             urls, children = locs, None
+            hreflang = _count_hreflang(r.body)
+            obsolete = b"schemas/sitemap/0.84" in r.body[:3000]
+            dead_children = []
+            template_maps = [u for u in locs if TEMPLATE_SITEMAP.search(u)] if is_index else []
             if is_index:
                 children = len(locs)
-                prefer = sorted(locs, key=lambda u: (not re.search(r"page|post|blog|main", u, re.I), u))
                 urls = []
-                for child in prefer[:3]:
+                ranked = rank_sitemaps([u for u in locs if u not in template_maps], home_url) + template_maps
+                for child in ranked[:3]:
                     cr = await self.fetch(child, kind="raw")
                     if cr.status_code == 200 and cr.body:
                         cp = parse_sitemap(cr.body)
                         if cp and not cp[0]:
                             urls.extend(cp[1])
+                            hreflang += _count_hreflang(cr.body)
+                            obsolete = obsolete or b"schemas/sitemap/0.84" in cr.body[:3000]
+                    else:
+                        dead_children.append(child)
+                # Children not read for URLs still get a status check: a listed child that 404s is a real bug.
+                for child in ranked[3:12]:
+                    cr = await self.fetch(child, kind="raw")
+                    if cr.status_code in DEAD_CODES:
+                        dead_children.append(child)
             blog = sum(classify_path(urlparse(u).path)[0] == "blog_post" for u in urls)
             return SitemapInfo(status="present", url=url, url_count=len(urls), blog_url_count=blog,
                                is_index=is_index, child_sitemaps=children,
-                               declared_in_robots=bool(declared), **sitemap_hygiene(urls)), urls[:2000]
+                               declared_in_robots=bool(declared), declared_count=len(declared),
+                               hreflang_annotations=hreflang, obsolete_namespace=obsolete,
+                               dead_children=dead_children[:5], template_sitemaps=template_maps[:5],
+                               homepage_listed=any(normalize_url(u) == normalize_url(home_url) for u in urls)
+                               if home_url else None,
+                               **sitemap_hygiene(urls)), urls[:2000]
         return SitemapInfo(status="invalid" if invalid_url else "missing", url=invalid_url,
                            declared_in_robots=bool(declared)), []
 
@@ -655,7 +749,10 @@ class _SiteSession:
 
         result.https = await self._https_info(home, https_ssl_error)
         result.not_found_probes = await self._probe_not_found(final_origin, home)
-        result.sitemap, sitemap_urls = await self._discover_sitemap(final_origin, result.robots.sitemaps)
+        result.duplicate_slugs = await self._check_duplicate_slugs(final_origin, home)
+        result.tag_manager = await self._read_tag_manager(home)
+        result.sitemap, sitemap_urls = await self._discover_sitemap(final_origin, result.robots.sitemaps,
+                                                                    home.final_url)
 
         candidates = select_pages(home, sitemap_urls, base_host, self.cfg)
         log.info("%s: %d candidate pages selected", result.final_domain, len(candidates))
@@ -682,7 +779,46 @@ class _SiteSession:
                 continue
             soup = BeautifulSoup(r.text or "", "lxml")
             title = soup.title.get_text(" ", strip=True) if soup.title else None
-            out.append(NotFoundProbe(url=url, status_code=r.status_code, title=title, words=_visible_words(soup)))
+            out.append(NotFoundProbe(url=url, status_code=r.status_code, title=title, words=_visible_words(soup),
+                                     final_url=r.final_url if r.final_url != url else None))
+        return out
+
+    async def _read_tag_manager(self, home: FetchResult) -> Optional[TagManagerInfo]:
+        """Most tracking lives inside the GTM container, not the page. Read the public container once."""
+        m = re.search(r"\bGTM-[A-Z0-9]{4,9}\b", home.text or "")
+        if not m:
+            return None
+        info = TagManagerInfo(container=m.group(0))
+        r = await self.fetch(f"https://www.googletagmanager.com/gtm.js?id={m.group(0)}", kind="raw")
+        if r.status_code != 200 or not r.text:
+            return info
+        info.fetched = True
+        js = r.text
+        for name, rx in GTM_PATTERNS.items():
+            ids = sorted({x if isinstance(x, str) else next((g for g in x if g), "") for x in rx.findall(js)} - {""})
+            if ids:
+                info.ids[name] = ids[:5]
+        info.ua_references = len(re.findall(r"UA-\d{4,10}-\d{1,4}", js))
+        return info
+
+    async def _check_duplicate_slugs(self, origin: str, home: FetchResult) -> list[DuplicateSlug]:
+        """Fetch both halves of up to 3 duplicate-alias pairs and compare status, title and canonical."""
+        out = []
+        for a, b in duplicate_slug_pairs(home)[:4]:
+            info = {}
+            for key, path in (("a", a), ("b", b)):
+                url = origin + path
+                if not self._allowed(url):
+                    break
+                r = await self.fetch(url, kind="raw")
+                soup = BeautifulSoup(r.text or "", "lxml")
+                canon = soup.find("link", rel="canonical")
+                info[key] = (r.status_code, soup.title.get_text(" ", strip=True) if soup.title else None,
+                             canon.get("href") if canon else None)
+            if len(info) == 2:
+                out.append(DuplicateSlug(path_a=a, path_b=b, status_a=info["a"][0], status_b=info["b"][0],
+                                         title_a=info["a"][1], title_b=info["b"][1],
+                                         canonical_a=info["a"][2], canonical_b=info["b"][2]))
         return out
 
     async def _diagnose_prefixes(self, result: CrawlResult, t0: float) -> None:
@@ -721,8 +857,11 @@ class _SiteSession:
                              t0: float) -> None:
         """Status-check a spread-out sample of sitemap URLs to estimate how many are dead. Not analyzed."""
         fetched = {normalize_url(p.url) for p in result.pages}
-        in_site = [u for u in (normalize_url(x) for x in sitemap_urls)
-                   if u and in_scope(u, base_host, self.cfg.include_subdomains)]
+        # Probe the URLs exactly as the sitemap lists them: normalising (e.g. dropping a trailing slash)
+        # would manufacture redirects that the site never serves to search engines.
+        in_site = [x for x in dict.fromkeys(sitemap_urls)
+                   if normalize_url(x) and normalize_url(x) not in fetched
+                   and in_scope(x, base_host, self.cfg.include_subdomains)]
         sm = result.sitemap
         for url in probe_sample(in_site, fetched, self.cfg.sitemap_probe):
             if time.monotonic() - t0 > self.cfg.site_time_budget or not self._allowed(url):
@@ -731,6 +870,10 @@ class _SiteSession:
             if r.outcome == "blocked":
                 break
             sm.probe_checked += 1
+            if r.redirects and r.status_code == 200:
+                sm.probe_redirected += 1
+                if len(sm.probe_redirect_examples) < 3:
+                    sm.probe_redirect_examples.append(f"{url} -> {r.final_url}")
             if r.status_code in DEAD_CODES:
                 sm.probe_dead += 1
                 if len(sm.probe_dead_examples) < 5:

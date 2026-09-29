@@ -100,7 +100,8 @@ def print_outcome(i: int, n: int, url: str, out: AnalysisOutcome) -> None:
     conf = f", {s['confidence']} confidence ({s['pages_scored']} pages)" if s.get("confidence") else ""
     print(f"  score : {score} ({s['label']}, coverage {int(s['coverage'] * 100)}%{conf})")
     tag = f" [{llm['error_type'].upper().replace('_', ' ')}]" if llm.get("error_type") else ""
-    print(f"  llm   : {llm['status']}{tag}" + (f" ({llm['reason']})" if llm.get("reason") else f" ({llm.get('model')})"))
+    model = f" ({llm.get('model')})" if llm.get("model") else ""
+    print(f"  llm   : {llm['status']}{tag}{model}" + (f" — {llm['reason'][:160]}" if llm.get("reason") else ""))
     print(f"  wins  : {len(r['quick_wins'])} quick wins ({high} high priority)")
     print(f"  saved : {out.path}")
 

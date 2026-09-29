@@ -1,5 +1,52 @@
 # History
 
+## 2026-09-29: No empty fields, internal linking, findings in the score
+
+### Requirements
+
+- No null or empty values in the summary (sector, captured_keywords, missed_keywords, ...), fields like the coworker's example
+- Add an internal-linking check and let serious findings lower the rating
+
+### Problems found and solutions applied
+
+| Problem | Solution |
+|---|---|
+| LLM fields empty whenever the LLM failed or was skipped | `llm.fallback` provider in config (Groq -> MiniMax, MiniMax -> Groq); if both fail, `seo/fallback.py` fills sector, keyword strategy, captured/missed keywords, competitive position and summary from measured facts, marked "(rule-based ...)" and listed in `llm_analysis.rule_filled` |
+| `country` null on .com sites | Country from JSON-LD address, then tel:/WhatsApp phone prefixes; otherwise an explicit "Not determined ..." |
+| `company` null | Organization JSON-LD, og:site_name, title prefix/suffix, homepage title matching the domain, then the domain |
+| Blocked sites: empty keywords, caveats, quick wins | Brand-only keywords labelled unverified, a score caveat, and a "make the site readable to crawlers" win |
+| Empty `site_specific_findings` | States what was checked and that nothing was found |
+| No internal-linking analysis | `internal_linking` check: card grids whose "Read More" links all point to one listing page, sampled pages nothing links to, generic-anchor share, internal nofollow |
+| Score 84 "Good" with lorem ipsum and a typo live | Score = technical hygiene minus 5 per high and 2 per medium finding (max 20); `technical_value` and `penalties` kept, caveat explains it |
+| Example fields missing | `technical_seo.internal_linking`, `technical_seo.seo_plugin`, `content_seo.entity_rich_content` |
+
+## 2026-09-29: Four-site benchmark (SUN Energy, Flex, Schneider Electric, McDermott) and Groq vs MiniMax
+
+### Requirements
+
+- Run the analyzer on sunenergy.id, flex.com, se.com, mcdermott.com; compare with an independent manual crawl and with the coworker's quality bar; improve the code; compare Groq with MiniMax
+
+### Problems found and solutions applied
+
+| Problem | Solution |
+|---|---|
+| se.com LLM call failed (413): robots.txt details carried 523 sitemap URLs into the digest | Digest lists/strings are bounded (`_slim`), hard size fallback; Groq `max_digest_chars` 10000 |
+| First 3 robots.txt sitemaps analysed (a UAE downloads sitemap on se.com) | Sitemaps ranked by the homepage's path prefix and content type (`rank_sitemaps`); declared count reported |
+| hreflang "missing" on se.com although the sitemaps carry 14k annotations | Sitemap hreflang annotations counted; hreflang present when in the sitemap |
+| "10 of 10 sampled URLs redirect" caused by our own URL normalisation | Sitemap URLs probed exactly as listed |
+| Tracking inside GTM invisible ("GTM" only) | Public GTM container read once: GA4, Google Ads, Meta Pixel, LinkedIn, TikTok, Hotjar, Clarity IDs, dead UA tags; GTM environment snippet flagged |
+| Name-mismatch false positives ("PLTS atau" vs "PLTS Atap", "lend" vs "led") | Only capitalised words against short menu labels |
+| LLM returned broken JSON / Indonesian prose / JSON fragments as keywords | Output validation with up to two correction rounds, tolerant JSON extraction, junk keywords stripped |
+| LLM proposed pages that already exist, invented subsidiaries as competitors | `existing_paths` in the digest + deterministic filter; prompt rules |
+| Missed site-specific defects | New findings: duplicate `-0` CMS pages (fetched and compared), Drupal hidden block titles as H2, generic "Home" title, template brand suffix pushing titles over 60, FAQ content without FAQPage, Organization without sameAs/logo/address, empty FAQPage, dev URL leaked in JSON-LD, author "Admin", relative logo, http Organization URL, invalid geo, zoom-blocking viewport, malformed numbers ("150,0000"), browser-extension attributes, empty/space-padded hrefs, malformed meta names, reused og:image, end-of-life server software, dead child sitemaps, truncated slugs, obsolete sitemap namespace, homepage missing from sitemap |
+| Platform "Not detected" / bare "PHP/8.1" | Builder.io, AEM, Sitecore, Laravel (XSRF cookie); hosting (Pantheon, Akamai, Cloudflare, Fastly, CloudFront, ...) and WordPress plugins (Rank Math, Yoast, TranslatePress, ...) |
+| Company / country null without the LLM | Company from Organization JSON-LD, og:site_name or title suffix; country from JSON-LD addressCountry |
+| Soft-404 via redirect described as "returns 200" | Probe records the redirect target |
+
+### Groq (gpt-oss-120b) vs MiniMax (MiniMax-M3), same crawl
+
+MiniMax-M3 writes site-specific analysis (named projects, products, executives, real competitors such as Xurya for SUN Energy, Subsea7/Saipem for McDermott) and keywords that match the business model ("PLTS tanpa modal", "skema PPA"). Groq gives generic CTA/FAQ advice and wrong competitors (Adaro, Pertamina for a C&I solar developer). MiniMax is slower (about 1 min per site) and sometimes needs a JSON correction round. Run it with `--config config.minimax.yaml`.
+
 ## 2026-09-28: Site-specific depth (comparison with a coworker's reports)
 
 ### Requirements

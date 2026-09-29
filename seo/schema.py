@@ -6,7 +6,7 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-SCHEMA_VERSION = "1.2"
+SCHEMA_VERSION = "1.4"
 
 CheckStatus = Literal["present", "missing", "partial", "not_checked", "error"]
 
@@ -52,6 +52,7 @@ class TechnicalSEO(BaseModel):
     platform: Check
     broken_links: Check
     not_found_handling: Check = Field(default_factory=lambda: not_checked("not_probed"))
+    internal_linking: Check = Field(default_factory=lambda: not_checked("no_usable_pages"))
 
 
 class RobotsInfo(BaseModel):
@@ -83,6 +84,16 @@ class SitemapInfo(BaseModel):
     prefix_counts: dict[str, int] = Field(default_factory=dict)
     prefix_fixes: dict[str, str] = Field(default_factory=dict)
     prefix_fix_examples: list[str] = Field(default_factory=list)
+    declared_count: int = 0
+    hreflang_annotations: int = 0
+    obsolete_namespace: bool = False
+    dead_children: list[str] = Field(default_factory=list)
+    template_sitemaps: list[str] = Field(default_factory=list)
+    homepage_listed: Optional[bool] = None
+    truncated_slugs: int = 0
+    truncated_examples: list[str] = Field(default_factory=list)
+    probe_redirected: int = 0
+    probe_redirect_examples: list[str] = Field(default_factory=list)
 
 
 class BrokenURL(BaseModel):
@@ -104,6 +115,27 @@ class NotFoundProbe(BaseModel):
     status_code: Optional[int] = None
     title: Optional[str] = None
     words: int = 0
+    final_url: Optional[str] = None
+
+
+class DuplicateSlug(BaseModel):
+    """Two live URLs that differ only by a CMS counter suffix (/x and /x-0)."""
+    path_a: str
+    path_b: str
+    status_a: Optional[int] = None
+    status_b: Optional[int] = None
+    title_a: Optional[str] = None
+    title_b: Optional[str] = None
+    canonical_a: Optional[str] = None
+    canonical_b: Optional[str] = None
+
+
+class TagManagerInfo(BaseModel):
+    """IDs found inside the public GTM container (tags fired through GTM never appear in the page HTML)."""
+    container: str
+    fetched: bool = False
+    ids: dict[str, list[str]] = Field(default_factory=dict)
+    ua_references: int = 0
 
 
 class BlockerCount(BaseModel):
@@ -133,6 +165,8 @@ class CrawlSummary(BaseModel):
     sitemap: SitemapInfo = Field(default_factory=SitemapInfo)
     https: Optional[HttpsInfo] = None
     not_found_probes: list[NotFoundProbe] = Field(default_factory=list)
+    duplicate_slugs: list[DuplicateSlug] = Field(default_factory=list)
+    tag_manager: Optional[TagManagerInfo] = None
     duration_seconds: float = 0.0
     user_agent: str = ""
 
@@ -188,6 +222,15 @@ class PageFacts(BaseModel):
     internal_links: int = 0
     link_locale_prefixes: list[str] = Field(default_factory=list)
     external_domains: list[str] = Field(default_factory=list)
+    internal_paths: list[str] = Field(default_factory=list)
+    link_targets: list[str] = Field(default_factory=list, exclude=True)
+    generic_anchors: list[list[str]] = Field(default_factory=list, exclude=True)
+    internal_nofollow: int = 0
+    tel_prefixes: list[str] = Field(default_factory=list)
+    faq_like: int = 0
+    org_name: Optional[str] = None
+    org_country: Optional[str] = None
+    org_fields: list[str] = Field(default_factory=list)
     external_links: int = 0
     nofollow_links: int = 0
     schema_types: list[str] = Field(default_factory=list)
@@ -232,6 +275,8 @@ class Score(BaseModel):
     confidence: Literal["high", "medium", "low", "none"] = "none"
     caveats: list[str] = Field(default_factory=list)
     breakdown: dict[str, ScoreItem] = Field(default_factory=dict)
+    technical_value: Optional[int] = None
+    penalties: list[str] = Field(default_factory=list)
 
 
 PRIORITIES = ("high", "medium", "low")
@@ -360,6 +405,7 @@ class LLMAnalysis(BaseModel):
     missed_keywords: list[KeywordSuggestion] = Field(default_factory=list)
     content_assessment: Optional[str] = None
     competitive_position: Optional[str] = None
+    rule_filled: list[str] = Field(default_factory=list)
 
 
 class Finding(BaseModel):
@@ -373,7 +419,7 @@ class Finding(BaseModel):
 
 class Locale(BaseModel):
     country: Optional[str] = None
-    country_source: Optional[Literal["tld", "content_language"]] = None
+    country_source: Optional[Literal["tld", "structured_data", "phone", "content_language"]] = None
     html_lang: Optional[str] = None
     content_language: Optional[str] = None
     privacy_law: Optional[str] = None

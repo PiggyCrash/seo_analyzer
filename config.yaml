@@ -16,18 +16,25 @@ crawl:
 
 llm:
   enabled: true
-  base_url: "https://api.groq.com/openai/v1"
-  model: "openai/gpt-oss-120b"
-  api_key_env: GROQ_API_KEY
-  max_tokens: 3500
-  max_digest_chars: 12000
-  requests_per_minute: 2
+  base_url: "https://api.minimax.io/v1"
+  model: "MiniMax-M3"
+  api_key_env: MINIMAX_API_KEY
+  max_tokens: 12000
+  max_digest_chars: 14000
+  requests_per_minute: 20
   temperature: 0.2
   timeout: 180
   max_retries: 3
   quota_cooldown_seconds: 900
   json_mode: true
   min_ok_pages: 3
+  fallback:
+    base_url: "https://api.groq.com/openai/v1"
+    model: "openai/gpt-oss-120b"
+    api_key_env: GROQ_API_KEY
+    max_tokens: 3500
+    max_digest_chars: 9000
+    requests_per_minute: 2
 
 storage:
   output_dir: output

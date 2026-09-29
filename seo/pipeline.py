@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import re
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,7 +13,7 @@ from typing import Optional
 
 from pydantic import ValidationError
 
-from . import __version__
+from . import __version__, fallback
 from .config import ROOT_DIR, Settings
 from .crawler import Crawler, CrawlResult
 from .extractor import boilerplate_text, build_findings, extract_page, rollup
@@ -37,12 +39,19 @@ class SEOPipeline:
         self.storage = Storage(settings.storage, ROOT_DIR)
         self._llm: Optional[LLMAnalyzer] = None
         self._llm_error: Optional[str] = None
+        self._fallback: Optional[LLMAnalyzer] = None
         if settings.llm.enabled:
             try:
                 self._llm = LLMAnalyzer(settings.llm)
             except LLMUnavailable as exc:
                 self._llm_error = str(exc)
                 log.warning("LLM disabled: %s", exc)
+            fb = settings.llm.fallback_config()
+            if fb:
+                try:
+                    self._fallback = LLMAnalyzer(fb)
+                except LLMUnavailable as exc:
+                    log.warning("fallback LLM disabled: %s", exc)
 
     @property
     def llm_problem(self) -> Optional[LLMUnavailable]:
@@ -85,18 +94,25 @@ class SEOPipeline:
             records.append(PageRecord(fetch=page.to_model(), facts=facts))
 
         tech, content, locale = rollup(records, summary)
-        score = compute_score(tech, content.pages_analyzed)
         findings = build_findings(records, summary, tech)
+        score = compute_score(tech, content.pages_analyzed, findings)
         rule_wins = rule_quick_wins(tech, content, findings)
         site = crawl.site_key
         llm, llm_wins = await self._run_llm(site, summary, tech, content, locale, records, rule_wins, findings,
                                             use_llm)
         # An LLM win on a mergeable topic (e.g. schema with the real legal name/ticker) replaces the generic rule win.
-        replaced = {q.related_check for q in llm_wins if q.related_check in MERGEABLE}
+        replaced = {q.related_check for q in llm_wins
+                    if q.related_check in MERGEABLE and re.search(r"organi[sz]ation", q.action, re.I)}
         rule_wins = [q for q in rule_wins if q.related_check not in replaced]
+        company = llm.company or _brand(records) or _domain_name(site)
+        before = llm.model_dump()
+        llm = fallback.fill(llm, records, tech, content, locale, findings, score, summary, site, company)
+        filled = [k for k, v in llm.model_dump().items() if v != before.get(k)]
+        if filled:
+            llm = llm.model_copy(update={"rule_filled": filled})
 
         return SiteReport(
-            tool_version=__version__, site=site, company=llm.company, sector=llm.sector,
+            tool_version=__version__, site=site, company=company, sector=llm.sector,
             input_url=crawl.input_url, analyzed_at=datetime.now(timezone.utc),
             analysis_seconds=round(time.monotonic() - t0, 2), crawl=summary, score=score,
             technical_seo=tech, content_stats=content, locale=locale, llm_analysis=llm, findings=findings,
@@ -108,7 +124,8 @@ class SEOPipeline:
         model = cfg.model
         if not use_llm or not cfg.enabled:
             return LLMAnalysis(status="skipped", reason="disabled", model=None), []
-        if self._llm is None:
+        providers = [a for a in (self._llm, self._fallback) if a is not None]
+        if not providers:
             return LLMAnalysis(status="skipped", reason=self._llm_error, model=model), []
 
         home_ok = bool(records) and records[0].fetch.outcome == "ok"
@@ -117,17 +134,57 @@ class SEOPipeline:
             reason = f"insufficient_data: homepage_ok={home_ok}, pages_ok={summary.pages_ok}, needed={needed}"
             return LLMAnalysis(status="skipped", reason=reason, model=model), []
 
-        digest = build_digest(site, summary, tech, content, locale, records, rule_wins, cfg.max_digest_chars,
-                              findings)
         nav = frozenset(t.casefold() for t in boilerplate_text([r.facts for r in records if r.facts]))
-        try:
-            out = await self._llm.analyze(digest, covered_topics(rule_wins), nav)
-        except LLMUnavailable as exc:
-            return LLMAnalysis(status="failed", error_type=exc.error_type, reason=str(exc)[:400], model=model), []
-        except Exception as exc:
-            log.error("LLM failed for %s: %s", site, exc)
-            kind = "invalid_output" if isinstance(exc, (ValueError, ValidationError)) else classify_error(exc)
-            return LLMAnalysis(status="failed", error_type=kind,
-                               reason=f"{type(exc).__name__}: {str(exc)[:300]}", model=model), []
-        data = out.model_dump(exclude={"quick_wins"})
-        return LLMAnalysis(status="ok", model=model, **data), out.quick_wins
+        failure: Optional[LLMAnalysis] = None
+        for analyzer in providers:
+            pcfg = analyzer.cfg
+            digest = build_digest(site, summary, tech, content, locale, records, rule_wins, pcfg.max_digest_chars,
+                                  findings)
+            try:
+                out = await analyzer.analyze(digest, covered_topics(rule_wins), nav)
+            except LLMUnavailable as exc:
+                failure = LLMAnalysis(status="failed", error_type=exc.error_type, reason=str(exc)[:400],
+                                      model=pcfg.model)
+            except Exception as exc:
+                log.error("LLM %s failed for %s: %s", pcfg.model, site, exc)
+                kind = "invalid_output" if isinstance(exc, (ValueError, ValidationError)) else classify_error(exc)
+                failure = LLMAnalysis(status="failed", error_type=kind, model=pcfg.model,
+                                      reason=f"{type(exc).__name__}: {str(exc)[:300]}")
+            else:
+                data = out.model_dump(exclude={"quick_wins"})
+                note = f"fallback after {failure.model}: {failure.reason[:120]}" if failure else None
+                return LLMAnalysis(status="ok", model=pcfg.model, reason=note, **data), out.quick_wins
+            if len(providers) > 1 and analyzer is providers[0]:
+                log.warning("LLM %s failed for %s, trying fallback %s", pcfg.model, site, providers[1].cfg.model)
+        return failure, []
+
+
+def _domain_name(site: str) -> str:
+    """Last-resort company name from the domain: 'dexagroup.com' -> 'Dexagroup'."""
+    return site.split(".")[0].split("_")[0].replace("-", " ").title()
+
+
+def _brand(records: list[PageRecord]) -> Optional[str]:
+    """Company name without the LLM: Organization JSON-LD name, then og:site_name (when it is not a URL)."""
+    facts = [r.facts for r in records if r.facts]
+    name = next((f.org_name for f in facts if f.org_name), None)
+    if name:
+        return name
+    site_name = facts[0].og.get("og:site_name") if facts else None
+    if site_name and not site_name.lower().startswith(("http", "www.")):
+        return site_name
+    # A homepage title segment that spells the domain ("Zero Penny - ..." on zeropenny.co).
+    home_url = (records[0].fetch.final_url or records[0].fetch.url) if records else ""
+    domain = re.sub(r"[^a-z0-9]", "", home_url.split("//")[-1].split("/")[0].lower().replace("www.", "")
+                    .rsplit(".", 1)[0])
+    for seg in re.split(r"\s[|\-–—·»]\s", facts[0].title or "") if facts else []:
+        if domain and re.sub(r"[^a-z0-9]", "", seg.lower()) == domain.split(".")[0]:
+            return seg.strip()
+    # The brand the template puts before or after every title ("About Us | McDermott", "Kimia Farma | Profil").
+    tails = Counter(part.strip() for f in facts if f.title and re.search(r"\s[|\-–—·»]\s", f.title)
+                    for part in {re.split(r"\s[|\-–—·»]\s", f.title)[0], re.split(r"\s[|\-–—·»]\s", f.title)[-1]})
+    if tails:
+        tail, count = tails.most_common(1)[0]
+        if count >= max(3, len(facts) // 2) and 1 < len(tail) <= 40:
+            return tail
+    return None

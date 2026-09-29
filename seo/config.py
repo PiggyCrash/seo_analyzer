@@ -45,6 +45,15 @@ class LLMConfig:
     requests_per_minute: int = 20
     min_ok_pages: int = 3
     max_digest_chars: int = 14000
+    fallback: Optional[dict] = None
+
+    def fallback_config(self) -> Optional["LLMConfig"]:
+        """A second provider (same fields, overridden by `fallback:` in config.yaml) used when this one fails."""
+        if not self.fallback:
+            return None
+        base = {f.name: getattr(self, f.name) for f in fields(self) if f.name != "fallback"}
+        base.update({k: v for k, v in self.fallback.items() if k in base})
+        return LLMConfig(**base)
 
 
 @dataclass

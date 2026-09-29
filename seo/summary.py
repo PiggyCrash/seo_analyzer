@@ -9,7 +9,14 @@ from __future__ import annotations
 from typing import Any, Optional
 from urllib.parse import urlparse
 
-from .extractor import TRACKER_NAMES
+from .extractor import NAV_HEADING, TRACKER_NAMES
+from .fallback import entity_rich_content
+
+SEO_PLUGINS = ("Rank Math", "Yoast SEO", "All in One SEO", "SEOPress")
+COUNTRY_LABEL = {"ID": "Indonesia", "SG": "Singapore", "MY": "Malaysia", "TH": "Thailand", "PH": "Philippines",
+                 "VN": "Vietnam", "AU": "Australia", "NZ": "New Zealand", "GB": "United Kingdom", "IN": "India",
+                 "US": "United States", "HK": "Hong Kong", "JP": "Japan", "KR": "South Korea", "BR": "Brazil",
+                 "CA": "Canada", "EU": "European Union"}
 
 NOT_VERIFIED = "Not verified"
 
@@ -27,7 +34,10 @@ def _not_verified(c: dict) -> Optional[str]:
 
 
 def _path(url: Optional[str]) -> str:
-    return (urlparse(url).path or "/") if url else ""
+    if not url:
+        return ""
+    p = urlparse(url)
+    return (p.path or "/") + (f"?{p.query}" if p.query else "")
 
 
 def _text(c: dict, label: str) -> str:
@@ -42,6 +52,12 @@ def _text(c: dict, label: str) -> str:
     groups = d.get("duplicate_groups") or []
     if groups:
         text += ". Most reused: " + "; ".join(f"'{g['value'][:70]}' on {g['pages']} pages" for g in groups[:2])
+    if d.get("homepage_generic"):
+        text += f". The homepage title '{d['homepage_generic']}' is generic"
+    if d.get("template_suffix"):
+        text += (f". The template appends '{d['template_suffix'].strip()}' to {d['template_suffix_pages']} of {n}"
+                 + (f", which alone pushes {d['over_limit_only_because_of_suffix']} over the limit"
+                    if d.get("over_limit_only_because_of_suffix") else ""))
     if d.get("placeholder"):
         vals = ", ".join(f"'{v}'" for v in d.get("placeholder_values") or [])
         what = "bare title" if label == "title" else "placeholder description"
@@ -63,13 +79,17 @@ def _og(c: dict) -> str:
             extra.append(f"og:title is the constant '{d['constant_og_title']}' on every page")
         if d.get("og_site_name_is_url"):
             extra.append(f"og:site_name is a URL ('{d['og_site_name_is_url']}')")
+        if d.get("reused_og_image"):
+            extra.append(f"the same og:image '{d['reused_og_image']['image']}' is used on "
+                         f"{d['reused_og_image']['pages']} different pages")
         if not tags:
             return "Partial — " + "; ".join(["no og tags on homepage"] + extra[1:] + (
                 [f"incomplete on {_plural(c['pages_affected'], 'page')}"] if c.get("pages_affected") else []))
         if d.get("examples_missing"):
             extra.append(f"missing on {_plural(len(d['examples_missing']), 'page')}")
         return f"Partial ({tags}) — " + "; ".join(extra)
-    return f"Present ({tags})"
+    tw = f"; twitter:card '{d['twitter_card']}'" if d.get("twitter_card") else "; no twitter:card"
+    return f"Present ({tags}){tw}"
 
 
 def _h1(c: dict) -> str:
@@ -107,7 +127,7 @@ def _alt(c: dict) -> str:
         return "No <img> tags found"
     missing = d.get("images_missing_alt", 0)
     empty = d.get("images_empty_alt", 0)
-    empty_txt = f"; {empty} more use alt=\"\"" if empty else ""
+    empty_txt = f"; {empty} of the {total} images use an empty alt=\"\" (fine only for decoration)" if empty else ""
     if not missing:
         return f"All {total} images have an alt attribute{empty_txt}"
     text = f"{missing} of {total} images missing alt text (on {_plural(c.get('pages_affected') or 0, 'page')})"
@@ -127,7 +147,15 @@ def _schema(c: dict) -> str:
     if d.get("blog_posts_checked") and d.get("blog_posts_with_article_schema", 0) < d["blog_posts_checked"]:
         gaps.append("Article schema on some blog posts")
     where = "" if c["status"] == "present" else " (inner pages only, not on homepage)"
-    return f"Found: {types}{where}" + (f" — missing {', '.join(gaps)}" if gaps else "")
+    text = f"Found: {types}{where}" + (f" — missing {', '.join(gaps)}" if gaps else "")
+    if d.get("organization_missing_fields"):
+        name = f" '{d['organization_name']}'" if d.get("organization_name") else ""
+        text += f". Organization{name} lacks {', '.join(d['organization_missing_fields'])}"
+    if d.get("faq_content_without_faqpage"):
+        eg = _path((d.get("examples_faq_without_schema") or [""])[0])
+        text += (f". Q&A content on {eg} ({d.get('faq_questions_on_first')} questions) has no FAQPage markup"
+                 + (f" (+{d['faq_content_without_faqpage'] - 1} more pages)" if d["faq_content_without_faqpage"] > 1 else ""))
+    return text
 
 
 def _canonical(c: dict) -> str:
@@ -171,7 +199,27 @@ def _sitemap(c: dict) -> str:
         problems.append(f"{d['malformed_entries']} malformed entries (e.g. '{eg}')")
     if d.get("duplicate_entries"):
         problems.append(f"{d['duplicate_entries']} duplicate entries")
-    return text + (". BROKEN: " + "; ".join(problems) if problems else "")
+    if d.get("dead_children"):
+        problems.append("listed child sitemap(s) return 404: " + ", ".join(_path(u) for u in d["dead_children"][:2]))
+    if d.get("truncated_slugs"):
+        problems.append(f"{d['truncated_slugs']} slug(s) cut off mid-word (e.g. "
+                        f"{_path((d.get('truncated_examples') or [''])[0])})")
+    if d.get("probe_redirected"):
+        eg = (d.get("probe_redirect_examples") or [""])[0]
+        eg = f" (e.g. {_path(eg.split(' -> ')[0])} -> {_path(eg.split(' -> ')[-1])})" if eg else ""
+        problems.append(f"{d['probe_redirected']} of {d.get('probe_checked')} sampled URLs redirect{eg}")
+    if d.get("homepage_listed") is False:
+        problems.append("the homepage is not listed")
+    if d.get("obsolete_namespace"):
+        problems.append("uses the obsolete Google 0.84 namespace")
+    if d.get("template_sitemaps"):
+        problems.append("the index lists page-builder template sitemaps (" + ", ".join(
+            _path(u) for u in d["template_sitemaps"][:2]) + "), which publish header/footer/popup templates as URLs")
+    if d.get("declared_count", 0) > 3:
+        text += f". robots.txt declares {d['declared_count']} sitemaps; analysed {c.get('value')}"
+    if d.get("hreflang_annotations"):
+        text += f". Carries {d['hreflang_annotations']} hreflang annotations"
+    return text + (". PROBLEMS: " + "; ".join(problems) if problems else "")
 
 
 def _robots(c: dict) -> str:
@@ -199,8 +247,19 @@ def _analytics(c: dict) -> str:
             text += f" — inner pages only ({cov['pages']} of {n}), not on the homepage"
         parts.append(text)
     text = " + ".join(parts)
-    if coverage and not d.get("google_analytics"):
-        text += ". No Google Analytics 4 / Tag Manager detected"
+    via = d.get("via_gtm") or {}
+    if via:
+        inner = [f"{TRACKER_NAMES.get(k, k)} ({', '.join(v[:3])})" for k, v in via.items() if k != "universal_analytics"]
+        if inner:
+            text += f". Inside {d.get('gtm_container')}: " + ", ".join(inner)
+    elif d.get("gtm_container") and not d.get("gtm_container_read"):
+        text += f". Contents of {d['gtm_container']} not readable"
+    if d.get("dead_universal_analytics"):
+        text += f". Dead Universal Analytics IDs still configured: {', '.join(d['dead_universal_analytics'][:3])}"
+    if d.get("gtm_environment_snippet"):
+        text += ". GTM is loaded with an environment (gtm_preview) snippet"
+    if coverage and not d.get("google_analytics") and d.get("gtm_container_read", True):
+        text += ". No Google Analytics 4 detected"
     return text
 
 
@@ -218,6 +277,8 @@ def _ssl(c: dict) -> str:
 
 def _mobile(c: dict) -> str:
     if c["status"] == "present":
+        if (c.get("details") or {}).get("zoom_blocked"):
+            return f"Responsive viewport, but it blocks pinch-zoom ('{c.get('value')}'), an accessibility failure"
         return "Responsive viewport meta tag present"
     if c["status"] == "partial":
         return f"Viewport tag present but not responsive ('{c.get('value')}')"
@@ -225,15 +286,24 @@ def _mobile(c: dict) -> str:
 
 
 def _platform(c: dict) -> str:
+    d = c.get("details") or {}
+    extra = ""
+    if d.get("tools"):
+        extra += f" with {', '.join(d['tools'])}"
+    if d.get("hosting"):
+        extra += f", served via {' + '.join(d['hosting'])}"
     if c.get("value"):
-        return c["value"]
-    gen = (c.get("details") or {}).get("generator")
-    return f"Unknown (generator: {gen})" if gen else "Not detected"
+        return c["value"] + extra
+    gen = d.get("generator")
+    return (f"Unknown (generator: {gen})" if gen else "Not detected") + extra
 
 
 def _cookie(c: dict) -> str:
     d = c["details"]
     if c["status"] == "present":
+        if str(c.get("value", "")).startswith("heuristic"):
+            return ("Cookie notice text found, but no consent-management platform detected — verify that trackers "
+                    "wait for consent")
         return f"Present ({c.get('value')})"
     if d.get("tracking_without_detected_consent"):
         law = d.get("privacy_law") or "privacy law"
@@ -248,6 +318,11 @@ def _lang(c: dict) -> str:
     if c["status"] == "missing":
         return f"MISSING <html lang>{detected}"
     if c["status"] == "partial":
+        ex = d.get("mismatch_examples") or []
+        if ex:
+            e0 = ex[0]
+            return (f"MISMATCH on {_plural(c.get('pages_affected') or 0, 'page')}: e.g. {_path(e0['url'])} declares "
+                    f"'{e0['declared']}' but its content is '{e0['detected']}'")
         return f"MISMATCH — declared '{c.get('value')}'{detected} ({_plural(c.get('pages_affected') or 0, 'page')})"
     return f"'{c.get('value')}'{detected}"
 
@@ -269,6 +344,35 @@ def _broken(c: dict) -> str:
     return f"{_plural(c.get('value') or 0, 'URL')} return 404/410 ({'; '.join(parts)}) — sample only"
 
 
+def _internal(c: dict) -> str:
+    d = c.get("details") or {}
+    parts = [f"avg {d.get('avg_internal_links', 0)} internal links per page"]
+    for fnl in (d.get("card_funnels") or [])[:1]:
+        parts.append(f"the {fnl['count']} '{fnl['anchor']}' links on {fnl['page']} all point to {fnl['target']} "
+                     "instead of the individual items")
+    if d.get("unlinked_in_sample"):
+        eg = ", ".join(_path(u) for u in (d.get("examples_unlinked") or [])[:2])
+        parts.append(f"{d['unlinked_in_sample']} of {c.get('pages_checked')} sampled pages get no links from the "
+                     f"other sampled pages ({eg})")
+    if d.get("generic_anchor_links"):
+        top = (d.get("top_generic_anchors") or [{}])[0]
+        parts.append(f"{d['generic_anchor_links']} generic anchors ({round(100 * d.get('generic_anchor_share', 0))}% "
+                     f"of internal links, most often '{top.get('text')}' x{top.get('count')})")
+    if d.get("internal_nofollow"):
+        parts.append(f"{d['internal_nofollow']} internal links are nofollow")
+    return ("Needs work — " if c["status"] == "partial" else "Healthy — ") + "; ".join(parts)
+
+
+def _seo_plugin(report: dict) -> str:
+    p = (report["technical_seo"].get("platform") or {})
+    tools = (p.get("details") or {}).get("tools") or []
+    found = [t for t in tools if t in SEO_PLUGINS]
+    if found:
+        return ", ".join(found)
+    platform = p.get("value") or "the platform"
+    return f"None detected — SEO fields come from {platform}'s built-in settings"
+
+
 def _not_found(c: dict) -> str:
     d = c["details"]
     shells = d.get("empty_template_pages") or 0
@@ -276,6 +380,10 @@ def _not_found(c: dict) -> str:
     shell_txt = f"; {shells} of the {c.get('pages_checked')} sampled pages are that empty shell ({eg})" if shells else ""
     if c["status"] == "missing":
         probe = next((p for p in reversed(d.get("probes") or []) if p.get("status_code") == 200), {})
+        if probe.get("final_url"):
+            return (f"Soft 404 — unknown URLs redirect to an error page that answers HTTP 200 "
+                    f"({_path(probe.get('url'))} -> {_path(probe['final_url'])}), which Google treats as a soft 404"
+                    f"{shell_txt}")
         return (f"CRITICAL — unknown URLs return HTTP 200 instead of 404 ({_path(probe.get('url'))} -> 200, "
                 f"title '{probe.get('title') or ''}'), so every junk URL is an indexable empty page{shell_txt}")
     if c["status"] == "partial":
@@ -286,7 +394,9 @@ def _not_found(c: dict) -> str:
 def _hreflang(c: dict) -> str:
     d = c.get("details") or {}
     if c.get("value"):
-        return "Present (" + ", ".join(c["value"]) + ")"
+        return "Present (" + ", ".join(c["value"]) + ")" + (" — no x-default" if d.get("x_default_missing") else "")
+    if d.get("in_sitemap"):
+        return f"Present in the XML sitemap ({d['in_sitemap']} annotations), not in the page HTML"
     if d.get("multilingual"):
         langs = d.get("html_lang_by_prefix") or {}
         per = "; ".join(f"/{k}/ declares lang={'/'.join(v)}" for k, v in langs.items())
@@ -325,6 +435,7 @@ FORMATTERS = (
     ("lang", "lang", lambda c, _: _lang(c)),
     ("hreflang", "hreflang", lambda c, _: _hreflang(c)),
     ("broken_links", "broken_links", lambda c, _: _broken(c)),
+    ("internal_linking", "internal_linking", lambda c, _: _internal(c)),
 )
 
 
@@ -332,7 +443,7 @@ def _home_h2(report: dict) -> list[str]:
     for page in report.get("pages") or []:
         facts = page.get("facts")
         if facts and facts.get("page_type") == "home":
-            return facts.get("h2") or []
+            return [h for h in facts.get("h2") or [] if not NAV_HEADING.match(h)]
     return []
 
 
@@ -422,25 +533,36 @@ def summarize(report: dict) -> dict[str, Any]:
              + (f"; {shells} empty template pages excluded" if shells else ""))
     severity = {"high": 0, "medium": 1, "low": 2}
     findings = [f["message"] for f in sorted(report.get("findings") or [], key=lambda f: severity[f["severity"]])]
+    if not findings:
+        findings = [f"No site-specific defects detected in the {cs['pages_analyzed']} pages sampled "
+                    "(checked: placeholders, typos, broken links, leaked headers, structured-data errors, JS-only "
+                    "counters, duplicate pages)"]
+    if "platform" in technical:
+        technical["seo_plugin"] = _seo_plugin(report)
+    code = loc.get("country")
+    country = (f"{code} ({COUNTRY_LABEL.get(code, code)}, from {loc.get('country_source') or 'tld'})" if code else
+               "Not determined — no country TLD, address in structured data or phone prefix found (treated as global)")
+    schema = (tech.get("schema_markup") or {}).get("details") or {}
     return {
         "site": report["site"],
-        "company": report.get("company"),
+        "company": report.get("company") or report["site"],
         "analysis_type": "SEO Analysis",
-        "sector": report.get("sector"),
+        "sector": report.get("sector") or llm.get("sector") or "Not classified",
         "analyzed_at": report["analyzed_at"],
-        "country": loc.get("country"),
+        "country": country,
         "data_coverage": _coverage(report),
         "overall_rating": _rating(report),
         "score_caveats": report["score"].get("caveats") or [],
         "technical_seo": technical,
         "site_specific_findings": findings,
         "content_seo": {
-            "keyword_strategy": llm.get("keyword_strategy") if llm_ok else _llm_missing(llm),
+            "keyword_strategy": llm.get("keyword_strategy") or _llm_missing(llm),
             "captured_keywords": llm.get("captured_keywords") or [],
             "missed_keywords": [k["keyword"] for k in llm.get("missed_keywords") or []],
             "pages": pages,
             "blog": _blog(report),
+            "entity_rich_content": entity_rich_content(schema, report.get("company")),
         },
-        "competitive_seo_position": llm.get("competitive_position") if llm_ok else _llm_missing(llm),
+        "competitive_seo_position": llm.get("competitive_position") or _llm_missing(llm),
         "quick_wins": _wins(report),
     }

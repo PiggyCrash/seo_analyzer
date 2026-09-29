@@ -1,0 +1,70 @@
+{
+  "site": "kimiafarma.co.id",
+  "company": "PT Kimia Farma Tbk (IDX: KAEF) — Bio Farma group",
+  "analysis_type": "SEO Analysis",
+  "sector": "Pharmaceutical manufacturing, distribution and retail — corporate / investor-relations site",
+  "analyzed_at": "2026-09-28",
+  "country": "ID",
+  "data_coverage": "15 URLs sampled of 217 unique sitemap URLs (267 <loc> entries); 4 of the 15 were empty soft-404 shells, so 11 real pages",
+  "overall_rating": "Poor — strong brand and HSTS/CSP security headers, but a broken CMS layer: any URL returns 200, 72% of the sitemap 404s, and every page shares one meta description",
+  "technical_seo": {
+    "meta_titles": "Pattern 'Kimia Farma | <menu label>' — homepage 'Kimia Farma | BUMN Farmasi Terbesar di Indonesia' (48 chars). 4 of 15 sampled pages have the bare title 'Kimia Farma |' (empty shells). Berita Korporat and Kabar TJSL both use the English 'Kimia Farma | Journal'. Contact page title is an 85-char sentence ('Hubungi kami melalui berbagai cara mudah...')",
+    "meta_descriptions": "One hard-coded sentence ('...didirikan sejak tahun 1817.') on 14 of 15 pages; the one news article sampled has the description '-' (a single hyphen)",
+    "og_tags": "Partial — tags exist but are template constants: og:title 'Kimia Farma' and og:url 'https://www.kimiafarma.co.id' on every non-article page, so every share card points to the homepage; og:site_name is set to a URL instead of the brand; fb:app_id and google-site-verification are empty strings",
+    "h1_tags": "Homepage has no H1 (its top heading is an H2 'Integrasi Layanan Farmasi Dari Hulu Ke Hilir'). 4 inner pages render an empty <h1></h1>. The article page repeats its title as both H1 and H2",
+    "h2_h3_hierarchy": "Template uses H5/H6 for layout: 23 H5s on the homepage (section labels such as 'ANAK USAHA', 'NEED HELP?') and an H6 for the phone number '1-500-255'. Subsidiary card reads 'MARIN LISA' while the menu says 'PT Marin Liza Farmasi'",
+    "image_alt_text": "The Bio Farma group logo (logo_bio.png) has no alt attribute on every page (one template fix clears 15 of the 15 counted cases). A further 15 content images use alt=\"\", including the 7 channel icons on the Contact Center page. Promo banners are labelled 'Promotion' / 'Banner'",
+    "schema_markup": "NONE — no JSON-LD or microdata on any sampled page. Missing: Organization (legalName, tickerSymbol KAEF, parentOrganization Bio Farma, subOrganization for Phapros, KFTD, KF Apotek, KF Diagnostika, SIL, KFSP), NewsArticle on /read/ pages, ContactPoint for contact center 1-500-255",
+    "canonical_urls": "Self-referencing, but also on the empty shells, so each junk URL declares itself canonical",
+    "soft_404": "CRITICAL — any path under /id/ returns HTTP 200 with the empty template (/id/halaman-tidak-ada-xyz → 200, title 'Kimia Farma |'). /id/profil, /id/profil-perusahaan, /id/sejarah and /id/corporate-info/company-structure are such shells, while the real history page is /id/sejarah-kimia-farma",
+    "sitemap": "Present but broken: 267 <loc> entries, 217 unique. 96 use /id-ID/ and 97 use /en-GB/ prefixes; the site only serves /id/ and /en/, so those 193 URLs (the whole news archive) 404, although the same slugs load under /id/read/. Also 17 entries of 'https://www.kimiafarma.co.id//', one '/6/bisnis', one malformed '/id/https://eproc.kimiafarma.co.id/...'. Not declared in robots.txt",
+    "robots_txt": "MISSING (404)",
+    "international": "Two URL trees (/id/, /en/), no hreflang. <html lang=\"en\"> on every page, including Indonesian ones. /en homepage still has the Indonesian title. English articles also resolve under /id/read/ (e.g. /id/read/kimia-farma-launches-15-new-pharmacy-outlets → 200), so duplicates exist across language prefixes",
+    "analytics": "Meta Pixel on inner pages only, not the homepage. No GA4 / GTM detected — a listed company with no web analytics in the HTML",
+    "ssl": "Yes — HSTS max-age 31536000 with includeSubDomains, strict CSP, X-Frame-Options. Leaks a debug header 'X-Debug-HTACCESS: Active'",
+    "mobile": "Viewport tag present; Bootstrap 5. Mobile menu omits PT Marin Liza Farmasi and PT Lucas Djaja, which the desktop menu lists",
+    "platform": "Custom PHP on CodeIgniter (ci_session cookie), Apache, theme path /themes/front_site/",
+    "content_rendering": "Homepage KPI counters ship as '0 +' in the HTML (FASILITAS PRODUKSI, OUTLET FARMASI, JUTA PELANGGAN...) and are filled in by JS, so non-JS crawlers and snippets see zeros",
+    "cookie_banner": "Not detected — Meta Pixel fires on inner pages without consent; UU PDP (Law 27/2022) gap"
+  },
+  "content_seo": {
+    "keyword_strategy": "No targeting. Titles are menu labels, meta descriptions are one constant, and the site is a corporate/IR hub. Consumer product and pharmacy intent is served by subsidiary domains (Kimia Farma Apotek, Phapros), so this site should own brand, investor, corporate-news and pharmacovigilance queries, not 'apotek terdekat'",
+    "captured_keywords": [
+      "Kimia Farma",
+      "BUMN farmasi terbesar",
+      "bahan baku obat (BBO) Kimia Farma Sungwun Pharmacopia",
+      "farmakovigilans Kimia Farma",
+      "laporan tahunan Kimia Farma",
+      "Kabar TJSL Kimia Farma"
+    ],
+    "missed_keywords": [
+      "saham KAEF",
+      "laporan keuangan Kimia Farma",
+      "dividen Kimia Farma",
+      "RUPS Kimia Farma",
+      "lapor efek samping obat",
+      "bahan baku obat dalam negeri",
+      "produk halal Kimia Farma",
+      "sel punca Kimia Farma",
+      "mitra binaan UMKM Kimia Farma",
+      "sejarah Kimia Farma 1817"
+    ],
+    "pages": "11 real pages in the sample. Word counts include the ~250-word mega-menu that is rendered twice (desktop + mobile), so the reported 570 average is inflated; the empty shells score 210+ words from chrome alone",
+    "blog": "News archive (/id/read/<slug>) exists and is reachable from Berita Korporat, but its sitemap URLs 404 and the article sampled has a '-' meta description",
+    "entity_rich_content": "Rich facts sit in plain text only: founded 1817, 49 distribution branches, >1,300 outlets, 400 clinics, 24,000 outlets / 23 million customers, contact center 1-500-255. None of it is in structured data"
+  },
+  "competitive_seo_position": "Brand queries are safe. Informational and IR queries ('saham KAEF', 'laporan keuangan Kimia Farma') compete with IDX, news portals and stock apps, which are likely to outrank a site whose news sitemap is 72% dead (no ranking data measured). The realistic win is recovering the ~190 news articles through a correct sitemap and making the IR pages indexable with unique titles",
+  "quick_wins": [
+    "Return real 404s for unknown slugs; 301 /id/sejarah and /id/profil to /id/sejarah-kimia-farma and /id/profil-perusahaan (to the real content page)",
+    "Regenerate sitemap.xml with /id/ and /en/ prefixes, drop the '//' and '/6/bisnis' rows, then add robots.txt with a Sitemap: line",
+    "Make og:url, og:title and meta description page-specific in the front_site template (one template edit fixes 14 pages)",
+    "Add alt=\"Bio Farma\" to logo_bio.png in the shared header",
+    "Promote the homepage H2 to H1 and fill the empty <h1> on the shell templates; restyle the H5/H6 labels as <p> or <div>",
+    "Set <html lang> from the URL prefix (id / en) and add hreflang pairs between /id/ and /en/ versions",
+    "Server-render the KPI numbers instead of '0 +'",
+    "Fix 'MARIN LISA' → 'Marin Liza' in the homepage subsidiary card",
+    "Add Organization JSON-LD with tickerSymbol KAEF, parentOrganization Bio Farma and the subsidiaries; NewsArticle on /read/ pages",
+    "Remove the X-Debug-HTACCESS response header",
+    "Add a UU PDP consent banner before the Meta Pixel loads"
+  ]
+}
