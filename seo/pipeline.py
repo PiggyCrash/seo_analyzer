@@ -18,7 +18,7 @@ from .config import ROOT_DIR, Settings
 from .crawler import Crawler, CrawlResult
 from .extractor import boilerplate_text, build_findings, extract_page, rollup
 from .llm import MERGEABLE, LLMAnalyzer, LLMUnavailable, build_digest, classify_error, covered_topics
-from .schema import LLMAnalysis, PageRecord, SiteReport
+from .schema import LLMAnalysis, LLMUsage, PageRecord, SiteReport
 from .scoring import compute_score, rule_quick_wins, sort_wins
 from .storage import Storage
 from .urlutils import normalize_input, site_key
@@ -143,23 +143,30 @@ class SEOPipeline:
             pcfg = analyzer.cfg
             digest = build_digest(site, summary, tech, content, locale, records, rule_wins, pcfg.max_digest_chars,
                                   findings)
+            usage: dict = {}
+            t0 = time.monotonic()
             try:
-                out = await analyzer.analyze(digest, covered_topics(rule_wins), nav)
+                out = await analyzer.analyze(digest, covered_topics(rule_wins), nav, usage=usage)
             except LLMUnavailable as exc:
                 failure = LLMAnalysis(status="failed", error_type=exc.error_type, reason=str(exc)[:400],
-                                      model=pcfg.model)
+                                      model=pcfg.model, usage=_usage(usage, t0))
             except Exception as exc:
                 log.error("LLM %s failed for %s: %s", pcfg.model, site, exc)
                 kind = "invalid_output" if isinstance(exc, (ValueError, ValidationError)) else classify_error(exc)
-                failure = LLMAnalysis(status="failed", error_type=kind, model=pcfg.model,
+                failure = LLMAnalysis(status="failed", error_type=kind, model=pcfg.model, usage=_usage(usage, t0),
                                       reason=f"{type(exc).__name__}: {str(exc)[:300]}")
             else:
                 data = out.model_dump(exclude={"quick_wins"})
                 note = f"fallback after {failure.model}: {failure.reason[:120]}" if failure else None
-                return LLMAnalysis(status="ok", model=pcfg.model, reason=note, **data), out.quick_wins
+                return (LLMAnalysis(status="ok", model=pcfg.model, reason=note, usage=_usage(usage, t0), **data),
+                        out.quick_wins)
             if len(providers) > 1 and analyzer is providers[0]:
                 log.warning("LLM %s failed for %s, trying fallback %s", pcfg.model, site, providers[1].cfg.model)
         return failure, []
+
+
+def _usage(usage: dict, t0: float) -> LLMUsage:
+    return LLMUsage(**usage, seconds=round(time.monotonic() - t0, 2))
 
 
 def _domain_name(site: str) -> str:

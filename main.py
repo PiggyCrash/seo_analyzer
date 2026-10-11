@@ -43,9 +43,9 @@ def parse_args(argv=None):
 def collect_urls(args) -> list[str]:
     raw = list(args.urls)
     if args.input:
-        for line in Path(args.input).read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
+        for line in Path(args.input).read_text(encoding="utf-8-sig").splitlines():
+            line = line.split(",")[0].strip().strip('"')  # CSV: first column only
+            if line and not line.startswith("#") and "." in line:  # a header like "Website" has no dot
                 raw.append(line)
     seen, out = set(), []
     for u in raw:
@@ -102,6 +102,11 @@ def print_outcome(i: int, n: int, url: str, out: AnalysisOutcome) -> None:
     tag = f" [{llm['error_type'].upper().replace('_', ' ')}]" if llm.get("error_type") else ""
     model = f" ({llm.get('model')})" if llm.get("model") else ""
     print(f"  llm   : {llm['status']}{tag}{model}" + (f" — {llm['reason'][:160]}" if llm.get("reason") else ""))
+    if llm.get("usage"):
+        u = llm["usage"]
+        print(f"  tokens: {u['total_tokens']} ({u['prompt_tokens']} in / {u['completion_tokens']} out, "
+              f"{u['reasoning_tokens']} reasoning) in {u['calls']} call(s), {u['seconds']}s; "
+              f"total site time {r['analysis_seconds']}s")
     print(f"  wins  : {len(r['quick_wins'])} quick wins ({high} high priority)")
     print(f"  saved : {out.path}")
 

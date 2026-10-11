@@ -456,7 +456,7 @@ class LLMAnalyzer:
                 await asyncio.sleep(wait)
             self._last = time.monotonic()
 
-    async def _chat(self, messages: list[dict]) -> str:
+    async def _chat(self, messages: list[dict], usage: Optional[dict] = None) -> str:
         from openai import BadRequestError
         kwargs = dict(model=self.cfg.model, messages=messages, temperature=self.cfg.temperature,
                       max_tokens=self.cfg.max_tokens)
@@ -472,13 +472,22 @@ class LLMAnalyzer:
                 resp = await self._create(**kwargs)
             else:
                 raise
+        if usage is not None:
+            u = getattr(resp, "usage", None)
+            details = getattr(u, "completion_tokens_details", None)
+            usage["calls"] = usage.get("calls", 0) + 1
+            for key, val in (("prompt_tokens", getattr(u, "prompt_tokens", 0)),
+                             ("completion_tokens", getattr(u, "completion_tokens", 0)),
+                             ("reasoning_tokens", getattr(details, "reasoning_tokens", 0)),
+                             ("total_tokens", getattr(u, "total_tokens", 0))):
+                usage[key] = usage.get(key, 0) + (val or 0)
         return resp.choices[0].message.content or ""
 
     async def analyze(self, digest: dict, rule_checks: frozenset[str] = frozenset(),
-                      nav_labels: frozenset[str] = frozenset()) -> LLMOutput:
+                      nav_labels: frozenset[str] = frozenset(), usage: Optional[dict] = None) -> LLMOutput:
         messages = [{"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": json.dumps(digest, ensure_ascii=False)}]
-        raw = await self._chat(messages)
+        raw = await self._chat(messages, usage)
         today = date.fromisoformat(digest["context"]["analysis_date"])
         elsewhere = served_elsewhere(digest["site"], digest["context"].get("related_domains") or [])
 
@@ -511,6 +520,6 @@ class LLMAnalyzer:
                 messages += [{"role": "assistant", "content": raw[-6000:]},
                              {"role": "user", "content": f"That response was invalid: {str(exc)[:800]}.{hint}\n"
                                                          "Return ONLY the corrected JSON object, prose in English."}]
-                raw = await self._chat(messages)
+                raw = await self._chat(messages, usage)
         home = next((p for p in digest.get("pages", []) if p.get("type") == "home"), {})
         return clean_output(out, today, rule_checks, nav_labels, elsewhere, home.get("existing_paths") or [])

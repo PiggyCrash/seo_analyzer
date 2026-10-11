@@ -58,6 +58,8 @@ class Storage:
             "llm_status": report.llm_analysis.status, "sector": report.sector,
             "quick_wins": len(report.quick_wins),
             "high_priority_wins": sum(q.priority == "high" for q in report.quick_wins),
+            "crawl_seconds": report.crawl.duration_seconds, "analysis_seconds": report.analysis_seconds,
+            "llm_usage": report.llm_analysis.usage.model_dump() if report.llm_analysis.usage else None,
             "file": str(hist.relative_to(self.out)),
         }
         with _lock:

@@ -400,8 +400,19 @@ class LLMOutput(BaseModel):
         return out
 
 
+class LLMUsage(BaseModel):
+    """Tokens and wall time spent on the LLM for one site (all calls, including correction rounds)."""
+    calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    reasoning_tokens: int = 0
+    total_tokens: int = 0
+    seconds: float = 0.0
+
+
 class LLMAnalysis(BaseModel):
     status: Literal["ok", "failed", "skipped"]
+    usage: Optional[LLMUsage] = None
     reason: Optional[str] = None
     error_type: Optional[Literal["quota_exhausted", "auth_failed", "transient", "invalid_output", "other"]] = None
     model: Optional[str] = None
