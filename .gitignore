@@ -1,8 +1,55 @@
+# ---------------------------------------------------------------
+# Secrets / environment
+# ---------------------------------------------------------------
 .env
-.venv/
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------
 __pycache__/
-*.pyc
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# ---------------------------------------------------------------
+# Runtime data (crawls, reports, batch runs)
+# ---------------------------------------------------------------
 output/
-cache/
 outputs/
 outputexamples/
+cache/
+batch_runs/
+batch_input/
+logs/
+*.log
+
+# ---------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local scratch notes
+notes/
